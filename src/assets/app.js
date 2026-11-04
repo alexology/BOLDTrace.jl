@@ -132,6 +132,8 @@ async function upload() {
   try {
     const r = await api("api/upload", { fasta: text, filename });
     state.token = r.token;
+    state.job = null; state.jobInfo = null;
+    $("reanalysis-box").hidden = true;
     $("stat-input").textContent = filename;
     $("stat-unique").textContent = r.n_unique;
     $("stat-accepted").textContent = "—"; $("stat-refs").textContent = "—";
@@ -159,18 +161,24 @@ async function upload() {
   }
 }
 
-async function analyze() {
+function formParams() {
   const f = $("analysis-form").elements;
   const num = (k) => Number(f[k].value);
+  return { min_identity: num("min_identity"), min_coverage: num("min_coverage"),
+           max_delta: num("max_delta"), max_matches: num("max_matches"),
+           min_align_length: num("min_align_length"), min_agreement: num("min_agreement"),
+           rank_cap: f.rank_cap.checked,
+           rank_thresholds: Object.fromEntries(state.options.ranks.map((r) => [r, num("thr_" + r)])) };
+}
+
+async function analyze() {
+  const f = $("analysis-form").elements;
   const body = {
     token: state.token, project: f.project.value, user: f.user.value,
     db: f.db.value, mode: f.mode.value, accept_rank: f.accept_rank.value,
-    params: { min_identity: num("min_identity"), min_coverage: num("min_coverage"),
-              max_delta: num("max_delta"), max_matches: num("max_matches"),
-              min_align_length: num("min_align_length"), min_agreement: num("min_agreement"),
-              rank_cap: f.rank_cap.checked,
-              rank_thresholds: Object.fromEntries(state.options.ranks.map((r) => [r, num("thr_" + r)])) },
+    params: formParams(),
   };
+  $("reanalysis-box").hidden = true;
   $("analyze-btn").disabled = true;
   $("analyze-btn").classList.add("busy");
   $("job-box").hidden = false;
@@ -201,6 +209,14 @@ async function poll() {
     $("job-error").textContent = j.error || "The analysis was cancelled because the server was stopped.";
     $("job-error").hidden = false; return;
   }
+  await showFinished(j);
+}
+
+// Shows a finished analysis (from BOLD or recomputed) and enables the
+// recomputation on its data.
+async function showFinished(j) {
+  state.job = j.id;
+  state.jobInfo = j;
   const s = j.summary;
   kpis($("job-kpis"), [["unique sequences", s.n_unique], ["accepted assignments", s.n_accepted],
     ["assigned to species", s.by_rank.species || 0], ["no admissible match", s.status.no_admissible_match || 0],
@@ -209,7 +225,38 @@ async function poll() {
   $("stats-project").value = j.project;
   $("stat-accepted").textContent = s.n_accepted;
   $("stat-refs").textContent = s.n_references_in_lca;
+  $("reanalysis-box").hidden = false;
+  syncReanalysisHint();
   await loadResults();
+}
+
+function syncReanalysisHint() {
+  const j = state.jobInfo, f = $("analysis-form").elements;
+  if (!j) return;
+  const changed = f.db.value !== j.db || f.mode.value !== j.mode;
+  $("reanalysis-hint").textContent = changed
+    ? "The BOLD library or search mode differs from the downloaded data (" + j.db + ", " + j.mode +
+      "): recomputing keeps the downloaded data; use Run analysis to query BOLD again."
+    : "Applies the parameters above to the BOLD hits and metadata already retrieved (" + j.db + ", " +
+      j.mode + "): no new BOLD request, results in seconds.";
+}
+
+async function reanalyze() {
+  const f = $("analysis-form").elements;
+  const btn = $("reanalyze-btn");
+  btn.disabled = true; btn.classList.add("busy");
+  $("job-error").hidden = true;
+  try {
+    const j = await api("api/reanalyze", { id: state.job, accept_rank: f.accept_rank.value,
+      params: formParams(), record: $("reanalysis-record").checked });
+    $("job-status").textContent = j.status;
+    fillList($("job-messages"), j.messages);
+    await showFinished(j);
+  } catch (e) {
+    $("job-error").textContent = e.message; $("job-error").hidden = false;
+  } finally {
+    btn.disabled = false; btn.classList.remove("busy");
+  }
 }
 
 async function loadResults() {
@@ -331,6 +378,9 @@ document.addEventListener("DOMContentLoaded", () => {
     if ($("fasta-text").value) { $("fasta-file").value = ""; $("file-name").textContent = ""; }
   });
   $("analyze-btn").addEventListener("click", analyze);
+  $("reanalyze-btn").addEventListener("click", reanalyze);
+  $("db-select").addEventListener("change", syncReanalysisHint);
+  $("mode-select").addEventListener("change", syncReanalysisHint);
   $("assign-filter").addEventListener("input", drawAssignments);
   $("ref-filter").addEventListener("input", drawReferences);
   $("stats-btn").addEventListener("click", loadStats);

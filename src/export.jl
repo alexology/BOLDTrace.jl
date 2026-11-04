@@ -106,6 +106,7 @@ function provenance(a::Analysis)
                            "(identified_by, reference sequences); attribution and identical-sequence checks are incomplete.")
     return Dict{String,Any}(
         "analysis_id" => a.id, "fingerprint" => a.fingerprint,
+        "reanalysis_of" => get(a.source, "reanalysis_of", nothing),
         "created_at" => _iso(a.created_at), "project" => a.project, "user" => a.user,
         "input" => Dict("name" => a.input.name, "file_sha256" => a.input.file_sha256,
                         "sequence_set_hash" => a.input.set_hash,

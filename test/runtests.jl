@@ -340,6 +340,26 @@ end
     @test rc.rank == :genus && rc.rank_capped && rc.dissent[3] == :species
 end
 
+@testset "Recompute LCA on downloaded data" begin
+    a, f = scenario()
+    n_requests = length(f.requests)
+    b = reanalyze(a; params = LCAParams(; min_agreement = 60))
+    @test length(f.requests) == n_requests              # no BOLD or portal request
+    @test b.id != a.id && b.fingerprint != a.fingerprint
+    @test b.source["reanalysis_of"] == a.id && b.source["retrieved_at"] == a.source["retrieved_at"]
+    @test provenance(b)["reanalysis_of"] == a.id && provenance(a)["reanalysis_of"] === nothing
+    rows = Dict(r.asv_id => r for r in assignment_table(b))
+    @test rows["A1"].taxon == "Onthophagus taurus" && rows["A2"].taxon == "Caccobius schreberi"
+    @test b.references["P1|COI-5P"].identified_by == "A. Rossi"   # portal metadata kept
+    @test isequal(b.hits, a.hits)
+    # Same parameters: same fingerprint, so not recorded twice.
+    c = reanalyze(a)
+    @test c.fingerprint == a.fingerprint
+    @test [r.taxon for r in assignment_table(c)] |> x -> isequal(x, [r.taxon for r in assignment_table(a)])
+    d = reanalyze(a; accept_rank = :species, project = "other")
+    @test d.project == "other" && count(r -> r.accepted, assignment_table(d)) == 1
+end
+
 @testset "Provenance and exports" begin
     a, _ = scenario()
     p = provenance(a)
@@ -512,6 +532,26 @@ end
         end
         @test jsonof(req("GET", "/api/job?id=$(j2[:id])"))[:recorded][:recorded] == false
         @test jsonof(req("GET", "/api/stats"))[:global_][:n_events] == 16
+        # Recompute LCA on the downloaded data: no BOLD request, not recorded by default.
+        n_req = length(f.requests)
+        before = jsonof(req("GET", "/api/stats"))[:global_][:n_events]
+        rj = jsonof(req("POST", "/api/reanalyze"; body = JSON3.write((id = id, params = (min_agreement = 60,)))))
+        @test rj[:status] == "done" && rj[:reanalysis_of] == job[:provenance_id]
+        @test rj[:summary][:by_rank][:species] == 2 && rj[:recorded][:recorded] == false
+        @test rj[:params][:min_agreement] == 60 && rj[:db] == "animal_public"
+        @test length(f.requests) == n_req
+        @test jsonof(req("GET", "/api/stats"))[:global_][:n_events] == before
+        ra = jsonof(req("GET", "/api/assignments?id=$(rj[:id])"))
+        @test ra[1][:taxon] == "Onthophagus taurus" && ra[1][:n_dissenting] == 1
+        @test req("GET", "/api/export?id=$(rj[:id])&file=analysis_provenance.json").status == 200
+        # Recorded on request; a recomputation can start from a recomputation.
+        rr = jsonof(req("POST", "/api/reanalyze"; body = JSON3.write((id = rj[:id], record = true,
+                                                                      params = (min_agreement = 60,)))))
+        @test rr[:recorded][:recorded] == true
+        @test jsonof(req("GET", "/api/stats"))[:global_][:n_events] == before + 8
+        @test req("POST", "/api/reanalyze"; body = JSON3.write((id = "nope",))).status == 404
+        @test req("POST", "/api/reanalyze"; body = JSON3.write((id = id, params = (max_delta = -1,)))).status == 400
+        @test req("POST", "/api/reanalyze"; body = JSON3.write((id = id, record = "yes"))).status == 400
         # Checkpoint reused: the second run sent no new submission.
         @test count(startswith("POST"), f.requests) == 1
         @test req("GET", "/missing").status == 404

@@ -243,6 +243,11 @@ button { cursor: pointer; }
   letter-spacing: 0.02em;
 }
 .primary:hover { background: #63d6f6; }
+.primary.secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+.primary.secondary:hover { background: var(--accent-soft); }
+.reanalysis { border-top: 1px solid var(--line); padding-top: 14px; }
+.reanalysis-text { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 220px; }
+.reanalysis .switch { margin-right: 4px; }
 .primary:disabled { cursor: default; background: var(--accent-strong); opacity: .55; }
 .primary.busy { opacity: 1; cursor: progress; }
 .spinner {

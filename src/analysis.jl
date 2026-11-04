@@ -61,7 +61,10 @@ Result of [`run_analysis`](@ref) or [`analyze_hits`](@ref): identifiers
 (`id`, `fingerprint`), `created_at` (UTC), `project`, `user`, the `input`,
 LCA `params`, `accept_rank`, data `source` (provenance of the BOLD data),
 one `LCAResult` and the `MatchRow`s per unique sequence (`results`,
-`matches`), the `references` by key and non-fatal `errors`.
+`matches`), the `references` by key, non-fatal `errors`, and the downloaded
+data (`hits` from the identification engine, portal `records` or
+`nothing`), kept so that [`reanalyze`](@ref) can recompute the LCA without
+contacting BOLD again.
 """
 struct Analysis
     id::String
@@ -77,6 +80,8 @@ struct Analysis
     matches::Vector{Vector{MatchRow}}
     references::Dict{String,ReferenceRecord}
     errors::Vector{String}
+    hits::DataFrame
+    records::Union{Nothing,DataFrame}
 end
 
 """
@@ -268,7 +273,28 @@ function analyze_hits(input::InputSet, hits::AbstractDataFrame, records = nothin
     created = _now_utc()
     fp = _fingerprint(String(project), String(user), input, source, params, accept_rank)
     return Analysis(string(uuid4()), fp, created, String(project), String(user), input, params,
-                    accept_rank, source, results, matches, references, collect(String, errors))
+                    accept_rank, source, results, matches, references, collect(String, errors),
+                    DataFrame(hits; copycols = false),
+                    records === nothing ? nothing : DataFrame(records; copycols = false))
+end
+
+"""
+    reanalyze(a::Analysis; params = a.params, accept_rank = a.accept_rank,
+              project = a.project, user = a.user) -> Analysis
+
+New analysis computed from the data already downloaded for `a` (BOLD hits
+and portal metadata): no request to BOLD. Use it to try other LCA
+parameters. The provenance keeps the original data source and retrieval
+date and records `reanalysis_of = a.id`. The BOLD library and search mode
+cannot change (they decide which hits exist): a lower `min_identity` than
+the minimum of the search mode (e.g. 94 % in rapid mode) finds no new hits.
+"""
+function reanalyze(a::Analysis; params::LCAParams = a.params, accept_rank::Symbol = a.accept_rank,
+                   project::AbstractString = a.project, user::AbstractString = a.user)
+    source = copy(a.source)
+    source["reanalysis_of"] = a.id
+    return analyze_hits(a.input, a.hits, a.records; project, user, params, accept_rank, source,
+                        errors = copy(a.errors))
 end
 
 _col(df, name, row) = hasproperty(df, name) ? df[row, name] : missing

@@ -299,14 +299,56 @@ function _run_job!(app, job)
     end
 end
 
+# Recomputes the LCA of a finished analysis on its downloaded data, at once
+# (no BOLD request, so it does not wait behind analyses in the queue).
+# Recorded in the usage statistics only when `record` is true.
+function _handle_reanalyze(app)
+    p = _payload()
+    p isa JSON3.Object || throw(_RequestError(400, "expected a JSON object"))
+    id = _text_param(p, :id, "", 64)
+    src = lock(() -> get(app.jobs, id, nothing), app.lock)
+    src === nothing && throw(_RequestError(404, "unknown analysis"))
+    src.status === :done || throw(_RequestError(409, "analysis not finished"))
+    app.stopping[] && throw(_RequestError(503, "the server is stopping"))
+    params = try
+        _params_from(p, src.analysis.params)
+    catch err
+        err isa ArgumentError || rethrow()
+        throw(_RequestError(400, err.msg))
+    end
+    accept = Symbol(_text_param(p, :accept_rank, String(src.analysis.accept_rank), 20))
+    accept in params.ranks || throw(_RequestError(400, "unknown accept_rank"))
+    record = get(p, :record, false)
+    record isa Bool || throw(_RequestError(400, "record must be true or false"))
+    a = reanalyze(src.analysis; params, accept_rank = accept)
+    request = merge(src.request, Dict{String,Any}("params" => params, "accept_rank" => accept))
+    msgs = ["LCA recomputed on the data downloaded by analysis $(src.id) (no BOLD request)"]
+    rec = if record
+        r = record_analysis!(app.store, a)
+        r.recorded || push!(msgs, "Same analysis already recorded ($(r.analysis_id)): usage counters not incremented")
+        r
+    else
+        push!(msgs, "Not recorded in the usage statistics")
+        (analysis_id = a.id, recorded = false, n_events = 0)
+    end
+    push!(msgs, "Finished")
+    job = _Job(string(uuid4()), :done, msgs, nothing, a, rec, request, src.input)
+    lock(() -> _keep_job!(app, job), app.lock)
+    return _json(200, _job_json(app, job))
+end
+
 function _job_json(app, job)
     msgs = lock(() -> copy(job.messages), app.lock)
     base = (id = job.id, status = job.status, messages = msgs, error = job.error,
             input = input_summary(job.input), project = job.request["project"],
-            user = job.request["user"])
+            user = job.request["user"], db = String(job.request["db"]),
+            mode = String(job.request["mode"]))
     job.status === :done || return base
     return merge(base, (summary = analysis_summary(job.analysis), recorded = job.recorded,
-                        provenance_id = job.analysis.id))
+                        provenance_id = job.analysis.id,
+                        reanalysis_of = get(job.analysis.source, "reanalysis_of", nothing),
+                        params = params_dict(job.analysis.params),
+                        accept_rank = String(job.analysis.accept_rank)))
 end
 
 function _matches_json(a::Analysis, hash::AbstractString)
@@ -342,6 +384,7 @@ function _register_routes(app::_App)
     get_("/api/options", () -> _json(200, _options(app)), :boldtrace_options)
     post("/api/upload", () -> _handle_upload(app), :boldtrace_upload)
     post("/api/analyze", () -> _handle_analyze(app), :boldtrace_analyze)
+    post("/api/reanalyze", () -> _handle_reanalyze(app), :boldtrace_reanalyze)
     get_("/api/job", () -> _json(200, _job_json(app, _get_job(app))), :boldtrace_job)
     get_("/api/assignments", () -> _json(200, assignment_table(_done_analysis(app)[2])),
          :boldtrace_assignments)

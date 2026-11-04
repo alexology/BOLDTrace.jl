@@ -43,7 +43,10 @@ opens `http://127.0.0.1:8080` with seven sections:
 - **Analysis**: BOLD library and search mode, every LCA parameter (identity,
   coverage, distance from the best match, number of matches, alignment
   length, minimum agreement, rank cap and its threshold for each rank),
-  progress and errors;
+  progress and errors. After an analysis, **Recompute LCA** applies new
+  parameters to the BOLD hits and metadata already downloaded, in seconds
+  and without any BOLD request; recomputations are recorded in the usage
+  statistics only when "Record in usage statistics" is ticked;
 - **Assignments**: ASV ID, taxon, rank, best identity, coverage, matches in
   the LCA, agreement and dissenting references; click a row to see every
   reference, included or excluded, with the reason. Downloads: assignments,
@@ -76,6 +79,8 @@ input = read_asvs("asvs.fasta")                    # validation, duplicates, has
 a = run_analysis(input; project = "lake2026", user = "AL",
                  params = LCAParams(min_identity = 90, min_coverage = 80, max_delta = 1),
                  db = :animal_public, mode = :rapid, checkpoint = "bold_checkpoint")
+
+b = reanalyze(a; params = LCAParams(min_agreement = 95))   # no BOLD request
 
 assignment_table(a)          # one row per input record
 match_table(a)               # every (ASV, reference) match with the LCA decision

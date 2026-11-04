@@ -101,6 +101,16 @@
       <span id="analyze-hint" class="muted">Validate a FASTA file first.</span>
       <button id="analyze-btn" class="primary" disabled><span class="spinner"></span>Run analysis</button>
     </div>
+    <div class="reanalysis" id="reanalysis-box" hidden>
+      <div class="input-meta">
+        <div class="reanalysis-text">
+          <strong>Recompute LCA on the downloaded data</strong>
+          <span class="muted small" id="reanalysis-hint">Applies the parameters above to the BOLD hits and metadata already retrieved: no new BOLD request, results in seconds.</span>
+        </div>
+        <label class="switch"><input type="checkbox" id="reanalysis-record"><span class="track"></span>Record in usage statistics</label>
+        <button id="reanalyze-btn" class="primary secondary"><span class="spinner"></span>Recompute LCA</button>
+      </div>
+    </div>
     <div id="job-box" hidden>
       <p class="status-line"><span class="muted">Status</span> <strong id="job-status"></strong></p>
       <ol id="job-messages" class="list small"></ol>
