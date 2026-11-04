@@ -115,6 +115,7 @@
       <p class="status-line"><span class="muted">Status</span> <strong id="job-status"></strong></p>
       <ol id="job-messages" class="list small"></ol>
       <p id="job-error" class="error" hidden></p>
+      <p><button type="button" id="retry-status" class="ghost" hidden>Retry status</button></p>
       <div class="kpis" id="job-kpis"></div>
     </div>
   </div>
@@ -173,7 +174,7 @@
   <div class="card-head"><h2>Export</h2></div>
   <div class="card-body">
     <ul id="export-list" class="downloads-list"></ul>
-    <p class="small muted">The provenance report records the BOLD library, retrieval date, parameters, LCA version and selected process IDs. The BOLD API does not provide a database version: the limitation is written in the report.</p>
+    <p class="small muted">The provenance report records the BOLD library, retrieval dates (hits reused from the checkpoint keep the date of their download), parameters, LCA version and selected process IDs. The BOLD API does not provide a database version: the limitation is written in the report.</p>
   </div>
 </section>
 

@@ -23,7 +23,7 @@ UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 BOLDassignment = {path = "../BOLDassignment.jl"}
 
 [compat]
-BOLDassignment = "0.1.1"
+BOLDassignment = "0.1.2"
 DBInterface = "2"
 DataFrames = "1"
 Dates = "1"

@@ -90,7 +90,8 @@ end
 One row per (unique sequence, reference record): `asv_ids` (all input IDs
 with that sequence), `sequence_hash`, `process_id`, `record_id`, `marker`,
 `bin_uri`, `reference_sequence_hash`, `reference_taxon`,
-`reference_rank`, one column per rank of the reference lineage,
+`reference_rank`, one column per rank of the reference lineage (as reported
+by BOLD with this hit),
 `identified_by`, `identity`, `coverage`, `align_length`, `included_in_lca`,
 `decision`, `final_taxon`, `final_rank`, `accepted`.
 """
@@ -100,9 +101,9 @@ function match_table(a::Analysis)
     for (i, u) in enumerate(a.input.unique), m in a.matches[i]
         ref = a.references[m.key]
         res = a.results[i]
-        taxon, rank = reference_taxon(ref, ranks)
+        taxon, rank = reference_taxon(m.lineage, ranks)     # as reported with this hit
         lineage = NamedTuple{Tuple(Symbol(:ref_, r) for r in ranks)}(
-            Tuple(get(ref.lineage, r, missing) for r in ranks))
+            Tuple(get(m.lineage, r, missing) for r in ranks))
         push!(rows, merge((asv_ids = _join(u.ids), sequence_hash = u.hash,
                            process_id = ref.process_id, record_id = ref.record_id,
                            marker = ref.marker, bin_uri = ref.bin_uri,
@@ -132,7 +133,10 @@ sequences of the analysis:
   set includes the record.
 
 These counts describe participation; they do not show that a record was
-necessary for an assignment. Sorted by decreasing participation.
+necessary for an assignment. Sorted by decreasing participation. When the
+hits of the analysis classify a record differently
+([`reference_conflicts`](@ref)), `taxon` and `rank` list all the
+classifications, separated by ` | `.
 """
 function reference_usage(a::Analysis)
     retrieved = Dict{String,Int}()
@@ -146,9 +150,15 @@ function reference_usage(a::Analysis)
         end
     end
     rows = NamedTuple[]
+    conflicts = reference_conflicts(a)
     for (key, n) in retrieved
         ref = a.references[key]
         taxon, rank = reference_taxon(ref, a.params.ranks)
+        if haskey(conflicts, key)    # all the classifications seen, never one by FASTA order
+            tr = [reference_taxon(l, a.params.ranks) for l in conflicts[key]]
+            taxon = join(unique(sort!([coalesce(t, "unclassified") for (t, _) in tr])), " | ")
+            rank = join(unique(sort!([coalesce(r, "unclassified") for (_, r) in tr])), " | ")
+        end
         push!(rows, (process_id = ref.process_id, record_id = ref.record_id, marker = ref.marker,
                      reference_sequence_hash = ref.sequence_hash, taxon = taxon, rank = rank,
                      identified_by = coalesce(ref.identified_by, NOT_PROVIDED),
@@ -194,7 +204,7 @@ function taxonomic_attribution(a::Analysis)
             ref = a.references[m.key]
             who = ident(ref)
             push!(get!(records, who, Set{String}()), m.key)
-            t, _ = reference_taxon(ref, a.params.ranks)
+            t, _ = reference_taxon(m.lineage, a.params.ranks)
             ismissing(t) || push!(get!(taxa, who, Set{String}()), t)
             get!(asvs, who, Set{Int}())
             m.included || continue

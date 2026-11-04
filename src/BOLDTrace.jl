@@ -32,6 +32,7 @@ using .LCA
 export LCA, LCAParams, LCAResult, Match, MatchDecision, lca, LCA_VERSION,
        InputSet, InputRecord, UniqueSequence, read_asvs, input_summary, sequence_hash,
        Analysis, ReferenceRecord, MatchRow, run_analysis, analyze_hits, reanalyze, accepted, supports, reference_taxon,
+       reference_conflicts, is_incomplete,
        assignment_table, match_table, reference_usage, taxonomic_attribution,
        analysis_summary,
        CitationLink, CITATION_RELATIONS, CITATION_STATUSES, used_process_ids, provenance,

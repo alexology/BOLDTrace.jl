@@ -1,7 +1,10 @@
 "use strict";
 // BOLDTrace web page. DOM is built with textContent only (no innerHTML).
 
-const state = { options: null, token: null, job: null, assignments: [], references: [] };
+// `ctx` changes whenever the shown context changes (new upload or new
+// analysis): responses and polls started in an older context are ignored.
+const state = { options: null, token: null, job: null, jobInfo: null, assignments: [], references: [],
+                ctx: 0, detail: 0 };
 
 function el(tag, attrs = {}, text) {
   const e = document.createElement(tag);
@@ -18,7 +21,11 @@ async function api(path, body) {
     { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
   const res = await fetch(path, opts);
   const data = await res.json().catch(() => ({ error: "invalid response" }));
-  if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+  if (!res.ok) {
+    const err = new Error(data.error || ("HTTP " + res.status));
+    err.status = res.status;
+    throw err;
+  }
   return data;
 }
 
@@ -124,6 +131,33 @@ async function loadOptions() {
   $("global-note").textContent = o.global_note;
 }
 
+const RESULT_TABS = ["assignments", "references", "attribution", "export"];
+const DOWNLOAD_LINKS = ["dl-assignments", "dl-matches", "dl-references", "dl-attribution", "dl-asv-matches"];
+
+// Forgets the analysis shown: tables, downloads and result tabs refer to
+// the previous input and must not stay visible under a new upload.
+function resetResults() {
+  state.ctx += 1; state.detail += 1;
+  state.job = null; state.jobInfo = null;
+  state.assignments = []; state.references = [];
+  for (const id of ["assign-table", "ref-table", "attr-table", "match-table", "export-list",
+                    "job-kpis", "job-messages"]) $(id).replaceChildren();
+  for (const id of DOWNLOAD_LINKS) $(id).removeAttribute("href");
+  $("match-panel").hidden = true;
+  $("match-title").textContent = "";
+  $("reanalysis-box").hidden = true;
+  $("job-box").hidden = true;
+  $("job-error").hidden = true;
+  $("job-status").textContent = "";
+  $("retry-status").hidden = true;
+  $("analyze-btn").classList.remove("busy");
+  document.querySelectorAll("#tabs button").forEach((b) => {
+    if (RESULT_TABS.includes(b.dataset.tab)) b.disabled = true;
+  });
+  const current = document.querySelector('#tabs button[aria-selected="true"]');
+  if (current && current.disabled) showTab("upload");
+}
+
 async function upload() {
   const file = $("fasta-file").files[0];
   const text = file ? await file.text() : $("fasta-text").value;
@@ -132,8 +166,7 @@ async function upload() {
   try {
     const r = await api("api/upload", { fasta: text, filename });
     state.token = r.token;
-    state.job = null; state.jobInfo = null;
-    $("reanalysis-box").hidden = true;
+    resetResults();
     $("stat-input").textContent = filename;
     $("stat-unique").textContent = r.n_unique;
     $("stat-accepted").textContent = "—"; $("stat-refs").textContent = "—";
@@ -178,17 +211,21 @@ async function analyze() {
     db: f.db.value, mode: f.mode.value, accept_rank: f.accept_rank.value,
     params: formParams(),
   };
+  const ctx = ++state.ctx;
   $("reanalysis-box").hidden = true;
   $("analyze-btn").disabled = true;
   $("analyze-btn").classList.add("busy");
   $("job-box").hidden = false;
   $("job-error").hidden = true;
+  $("retry-status").hidden = true;
   $("job-kpis").replaceChildren();
   try {
     const r = await api("api/analyze", body);
+    if (ctx !== state.ctx) return;
     state.job = r.id;
-    poll();
+    poll(ctx);
   } catch (e) {
+    if (ctx !== state.ctx) return;
     $("job-status").textContent = "not started";
     $("job-error").textContent = e.message; $("job-error").hidden = false;
     $("analyze-btn").disabled = false;
@@ -196,38 +233,73 @@ async function analyze() {
   }
 }
 
-async function poll() {
+// Errors worth retrying: no response (network) or a temporary server state.
+const transient = (e) => e.status === undefined || [429, 502, 503, 504].includes(e.status);
+const POLL_RETRIES = 8;
+
+function stopWaiting() {
+  $("analyze-btn").disabled = !state.token;
+  $("analyze-btn").classList.remove("busy");
+}
+
+// Polls the status of the current job. Temporary errors are retried with a
+// growing wait; then (or after another error) the page is released and
+// "Retry status" asks again about the same job, without a new BOLD query.
+async function poll(ctx, failures = 0) {
+  if (ctx !== state.ctx) return;
+  $("retry-status").hidden = true;
   let j;
   try { j = await api("api/job?id=" + encodeURIComponent(state.job)); }
-  catch (e) { $("job-error").textContent = e.message; $("job-error").hidden = false; return; }
+  catch (e) {
+    if (ctx !== state.ctx) return;
+    if (transient(e) && failures < POLL_RETRIES) {
+      const wait = Math.min(30, 3 * 2 ** failures);
+      $("job-error").textContent = "Status not available (" + e.message + "); retrying in " + wait + " s.";
+      $("job-error").hidden = false;
+      setTimeout(() => poll(ctx, failures + 1), wait * 1000);
+      return;
+    }
+    $("job-error").textContent = (e.status === 404
+      ? "The analysis is no longer available on the server (" + e.message + ")."
+      : "Cannot read the status of the analysis: " + e.message);
+    $("job-error").hidden = false;
+    stopWaiting();
+    $("retry-status").hidden = e.status === 404;
+    return;
+  }
+  if (ctx !== state.ctx) return;
+  $("job-error").hidden = true;
   $("job-status").textContent = j.status;
   fillList($("job-messages"), j.messages);
-  if (j.status === "queued" || j.status === "running") { setTimeout(poll, 3000); return; }
+  if (j.status === "queued" || j.status === "running") { setTimeout(() => poll(ctx), 3000); return; }
   $("analyze-btn").disabled = false;
   $("analyze-btn").classList.remove("busy");
   if (j.status === "failed" || j.status === "cancelled") {
     $("job-error").textContent = j.error || "The analysis was cancelled because the server was stopped.";
     $("job-error").hidden = false; return;
   }
-  await showFinished(j);
+  await showFinished(j, ctx);
 }
 
 // Shows a finished analysis (from BOLD or recomputed) and enables the
 // recomputation on its data.
-async function showFinished(j) {
+async function showFinished(j, ctx) {
+  if (ctx !== state.ctx) return;
   state.job = j.id;
   state.jobInfo = j;
   const s = j.summary;
   kpis($("job-kpis"), [["unique sequences", s.n_unique], ["accepted assignments", s.n_accepted],
     ["assigned to species", s.by_rank.species || 0], ["no admissible match", s.status.no_admissible_match || 0],
-    ["no BOLD match", s.status.no_matches || 0], ["references in LCA", s.n_references_in_lca],
+    ["no BOLD match", s.status.no_matches || 0],
+    ...(s.status.result_missing ? [["BOLD result missing", s.status.result_missing]] : []),
+    ["references in LCA", s.n_references_in_lca],
     ["process IDs retrieved", s.n_process_ids]]);
   $("stats-project").value = j.project;
   $("stat-accepted").textContent = s.n_accepted;
   $("stat-refs").textContent = s.n_references_in_lca;
   $("reanalysis-box").hidden = false;
   syncReanalysisHint();
-  await loadResults();
+  await loadResults(ctx);
 }
 
 function syncReanalysisHint() {
@@ -246,23 +318,27 @@ async function reanalyze() {
   const btn = $("reanalyze-btn");
   btn.disabled = true; btn.classList.add("busy");
   $("job-error").hidden = true;
+  const ctx = ++state.ctx;
   try {
     const j = await api("api/reanalyze", { id: state.job, accept_rank: f.accept_rank.value,
       params: formParams(), record: $("reanalysis-record").checked });
+    if (ctx !== state.ctx) return;
     $("job-status").textContent = j.status;
     fillList($("job-messages"), j.messages);
-    await showFinished(j);
+    await showFinished(j, ctx);
   } catch (e) {
+    if (ctx !== state.ctx) return;
     $("job-error").textContent = e.message; $("job-error").hidden = false;
   } finally {
     btn.disabled = false; btn.classList.remove("busy");
   }
 }
 
-async function loadResults() {
+async function loadResults(ctx) {
   const id = encodeURIComponent(state.job);
   const [assignments, references, attribution] = await Promise.all([
     api("api/assignments?id=" + id), api("api/references?id=" + id), api("api/attribution?id=" + id)]);
+  if (ctx !== state.ctx) return;
   state.assignments = assignments; state.references = references;
   document.querySelectorAll("#tabs button:disabled").forEach((b) => { b.disabled = false; });
   drawAssignments();
@@ -289,6 +365,7 @@ async function loadResults() {
 }
 
 function drawAssignments() {
+  state.detail += 1;                       // the open details are closed
   $("match-panel").hidden = true;
   const q = $("assign-filter").value.trim().toLowerCase();
   const rows = state.assignments.filter((r) => !q ||
@@ -305,18 +382,24 @@ function drawAssignments() {
 }
 
 async function showMatches(r) {
+  // Each selection supersedes the previous one: a late response for another
+  // ASV (or another context) is ignored.
+  const detail = ++state.detail;
   const panel = $("match-panel");
   panel.hidden = false;
+  $("match-table").replaceChildren();
   const link = $("dl-asv-matches");
   if (!r.sequence_hash) {
     $("match-title").textContent = r.asv_id + ": " + (r.error || "no sequence");
     $("match-table").replaceChildren(); link.hidden = true; return;
   }
+  const job = state.job, ctx = state.ctx;
   link.hidden = false;
-  link.href = "api/export?id=" + encodeURIComponent(state.job) + "&file=bold_matches.csv&hash=" +
+  link.href = "api/export?id=" + encodeURIComponent(job) + "&file=bold_matches.csv&hash=" +
     encodeURIComponent(r.sequence_hash);
   $("match-title").textContent = "References for " + r.asv_id + (r.taxon ? " → " + r.taxon + " (" + r.rank + ")" : "");
-  const rows = await api("api/matches?id=" + encodeURIComponent(state.job) + "&hash=" + encodeURIComponent(r.sequence_hash));
+  const rows = await api("api/matches?id=" + encodeURIComponent(job) + "&hash=" + encodeURIComponent(r.sequence_hash));
+  if (ctx !== state.ctx || detail !== state.detail) return;
   renderTable($("match-table"), rows, [
     { key: "process_id", label: "Process ID" }, { key: "marker", label: "Marker" },
     { key: "reference_taxon", label: "Taxon" }, { key: "identified_by", label: "Identified by" },
@@ -379,6 +462,11 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   $("analyze-btn").addEventListener("click", analyze);
   $("reanalyze-btn").addEventListener("click", reanalyze);
+  $("retry-status").addEventListener("click", () => {
+    if (!state.job) return;
+    $("analyze-btn").disabled = true; $("analyze-btn").classList.add("busy");
+    poll(state.ctx);
+  });
   $("db-select").addEventListener("change", syncReanalysisHint);
   $("mode-select").addEventListener("change", syncReanalysisHint);
   $("assign-filter").addEventListener("input", drawAssignments);

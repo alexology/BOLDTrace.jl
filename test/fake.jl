@@ -7,8 +7,9 @@ mutable struct FakeBOLD
     submissions::Dict{String,Vector{Pair{String,String}}}
     portal_fails::Bool
     requests::Vector{String}
+    omit::Set{String}          # sequences left out of finished submissions
 end
-FakeBOLD(catalog, portal) = FakeBOLD(catalog, portal, Dict(), false, String[])
+FakeBOLD(catalog, portal) = FakeBOLD(catalog, portal, Dict(), false, String[], Set{String}())
 
 _bytes(s) = Vector{UInt8}(codeunits(s))
 
@@ -41,6 +42,7 @@ function fake_request(f::FakeBOLD, method, url, payload)
     occursin("/status/", url) && return (200, _bytes("{\"status\":\"complete\"}"))
     io = IOBuffer()
     for (id, seq) in f.submissions[sub]
+        seq in f.omit && continue
         results = Dict{String,Any}()
         for (pid, marker, pdist, qcov, len, tax) in get(f.catalog, seq, [])
             results["$pid|$marker|BOLD:AAA0001|1|public|0"] =

@@ -3,7 +3,7 @@
 # AUTOINCREMENT, upserts with ON CONFLICT. Moving to PostgreSQL needs another
 # DBInterface driver and `$n` placeholders instead of `?`.
 
-const SCHEMA_VERSION = 1
+const SCHEMA_VERSION = 2
 
 """
 Note shown with every global statistic.
@@ -71,7 +71,11 @@ const _SCHEMA = [
         decision TEXT NOT NULL,
         accepted INTEGER NOT NULL,
         final_taxon TEXT,
-        final_rank TEXT)""",
+        final_rank TEXT,
+        ref_sequence_hash TEXT,
+        ref_taxon TEXT,
+        ref_rank TEXT,
+        ref_identified_by TEXT)""",
     """CREATE TABLE IF NOT EXISTS citation_links (
         process_id TEXT NOT NULL,
         doi TEXT NOT NULL,
@@ -112,8 +116,31 @@ function open_store(path::AbstractString = ":memory:")
         DBInterface.execute(db, "INSERT INTO schema_info (version) VALUES (?)", (SCHEMA_VERSION,))
     elseif v > SCHEMA_VERSION
         throw(ArgumentError("database schema version $v is newer than this package ($SCHEMA_VERSION)"))
+    elseif v < SCHEMA_VERSION
+        _migrate!(db, Int(v))
     end
     return UsageStore(db, String(path), ReentrantLock())
+end
+
+# Columns of the reference snapshot kept by each event (schema version 2).
+const _SNAPSHOT_COLUMNS = ("ref_sequence_hash" => "sequence_hash", "ref_taxon" => "taxon",
+                           "ref_rank" => "taxon_rank", "ref_identified_by" => "identified_by")
+
+# Version 1 events had no snapshot: it is taken from the reference catalogue
+# as it is when the database is migrated (the best information left).
+function _migrate!(db, v::Int)
+    SQLite.transaction(db) do
+        if v < 2
+            for (col, src) in _SNAPSHOT_COLUMNS
+                DBInterface.execute(db, "ALTER TABLE identification_events ADD COLUMN $col TEXT")
+                DBInterface.execute(db,
+                    """UPDATE identification_events SET $col = (SELECT r.$src FROM bold_references r
+                       WHERE r.record_key = identification_events.record_key)""")
+            end
+        end
+        DBInterface.execute(db, "UPDATE schema_info SET version = ?", (SCHEMA_VERSION,))
+    end
+    return nothing
 end
 
 Base.close(s::UsageStore) = (SQLite.close(s.db); nothing)
@@ -135,15 +162,22 @@ Store the analysis, its per-sequence results, the reference records and one
 identification event per (unique sequence, reference record). An analysis
 with the same fingerprint (same project, user, sequence set, BOLD database
 and mode, LCA version and parameters) is not recorded again: the result has
-`recorded = false` and the identifier of the existing analysis. Event keys
-are unique, so no event can be counted twice.
+`recorded = false`, `reason = "duplicate"` and the identifier of the existing
+analysis. An **incomplete** analysis, where BOLD did not return the result of
+some sequence (status `result_missing`), is not recorded either
+(`reason = "incomplete"`): otherwise the complete run with the same
+fingerprint would later be taken for a duplicate. Recorded analyses have
+`reason = "recorded"`. Event keys are unique, so no event can be counted
+twice.
 """
 function record_analysis!(store::UsageStore, a::Analysis)
+    is_incomplete(a) &&
+        return (analysis_id = a.id, recorded = false, n_events = 0, reason = "incomplete")
     lock(store.lock) do
         existing = _scalar(store.db, "SELECT analysis_id FROM analyses WHERE fingerprint = ?",
                            (a.fingerprint,))
         existing === missing ||
-            return (analysis_id = String(existing), recorded = false, n_events = 0)
+            return (analysis_id = String(existing), recorded = false, n_events = 0, reason = "duplicate")
         now = _iso(a.created_at)
         n_events = 0
         SQLite.transaction(store.db) do
@@ -169,19 +203,22 @@ function record_analysis!(store::UsageStore, a::Analysis)
                      res.best_identity, res.n_selected))
                 for m in a.matches[i]
                     ref = a.references[m.key]
+                    ref_taxon, ref_rank = reference_taxon(m.lineage, a.params.ranks)   # of this hit
                     key = bytes2hex(SHA.sha256(join((a.fingerprint, u.hash, m.key), '\n')))
                     DBInterface.execute(store.db,
                         """INSERT INTO identification_events (event_key, analysis_id, project,
                            user_name, created_at, sequence_hash, record_key, process_id, identity,
                            coverage, align_length, included_in_lca, decision, accepted,
-                           final_taxon, final_rank)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           final_taxon, final_rank, ref_sequence_hash, ref_taxon, ref_rank,
+                           ref_identified_by)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                            ON CONFLICT (event_key) DO NOTHING""",
                         (key, a.id, a.project, a.user, now, u.hash, m.key, ref.process_id,
                          m.identity, m.coverage, m.align_length, _db(m.included),
                          m.included && !supports(a, i, m) ? "dissent:$(m.dissent)" : String(m.reason),
                          _db(ok), _db(res.taxon),
-                         res.rank === nothing ? missing : String(res.rank)))
+                         res.rank === nothing ? missing : String(res.rank),
+                         ref.sequence_hash, _db(ref_taxon), _db(ref_rank), ref.identified_by))
                     n_events += 1
                 end
             end
@@ -207,7 +244,7 @@ function record_analysis!(store::UsageStore, a::Analysis)
                      ref.recordsets, now, now))
             end
         end
-        return (analysis_id = a.id, recorded = true, n_events = n_events)
+        return (analysis_id = a.id, recorded = true, n_events = n_events, reason = "recorded")
     end
 end
 
@@ -227,6 +264,9 @@ counter of the application:
   `n_reference_sequences` (distinct reference sequence hashes; records whose
   sequence was not retrieved count by record key), `n_process_ids_in_lca`;
 - `note`: [`GLOBAL_STATS_NOTE`](@ref).
+
+The figures use the reference snapshot stored with each event, so recording
+later analyses (with updated BOLD metadata) never changes them.
 """
 function usage_stats(store::UsageStore; project = nothing, user = nothing, analysis_id = nothing)
     where_, params = _filters(project, user, analysis_id)
@@ -246,9 +286,7 @@ function usage_stats(store::UsageStore; project = nothing, user = nothing, analy
          n_asvs = q("SELECT COUNT(DISTINCT e.sequence_hash) $ev"),
          n_process_ids = q("SELECT COUNT(DISTINCT e.process_id) $ev"),
          n_process_ids_in_lca = q("SELECT COUNT(DISTINCT e.process_id) $ev $(_and(where_)) e.included_in_lca = 1"),
-         n_reference_sequences = q("""SELECT COUNT(DISTINCT COALESCE(r.sequence_hash, 'record:' || e.record_key))
-                                      FROM identification_events e
-                                      JOIN bold_references r ON r.record_key = e.record_key $where_"""),
+         n_reference_sequences = q("SELECT COUNT(DISTINCT COALESCE(e.ref_sequence_hash, 'record:' || e.record_key)) $ev"),
          note = GLOBAL_STATS_NOTE)
     end
 end

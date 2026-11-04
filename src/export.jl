@@ -77,8 +77,9 @@ end
     provenance(a::Analysis) -> Dict
 
 Reproducibility report: analysis identifier and fingerprint, date (UTC),
-project and user, input hashes, BOLD data source and retrieval date,
-alignment software, LCA version and parameters, software versions, selected
+project and user, input hashes, BOLD data source and retrieval dates (run
+date, origin and date of the hits of each sequence: queried now or reused
+from the checkpoint, date of the portal metadata), alignment software, LCA version and parameters, software versions, selected
 process IDs per sequence, final assignments and known limitations.
 """
 function provenance(a::Analysis)
@@ -95,12 +96,20 @@ function provenance(a::Analysis)
     end
     limitations = String[
         "The BOLD API does not report a version or snapshot of the reference libraries; " *
-        "the retrieval date is recorded instead and results may change as BOLD is updated.",
+        "the retrieval dates are recorded instead (hits per sequence, portal metadata) and results " *
+        "may change as BOLD is updated.",
         "Alignments are computed by the BOLD identification engine on the BOLD servers; " *
         "the API does not report the alignment software or its version.",
         "Global statistics count only the analyses recorded by this application, not all uses of BOLD.",
         "The LCA rank is the depth of agreement among selected references, not a statistical confidence.",
     ]
+    hr = get(a.source, "hits_retrieval", nothing)
+    if hr isa AbstractDict && get(hr, "n_from_checkpoint", 0) > 0
+        push!(limitations, "The BOLD hits of $(hr["n_from_checkpoint"]) sequence(s) were reused from " *
+                           "the local checkpoint, retrieved from BOLD between $(hr["checkpoint_oldest"]) " *
+                           "and $(hr["checkpoint_newest"]) (file dates); BOLD may have changed since. " *
+                           "Per-sequence origin and date: bold_data_source.hits_retrieval.by_sequence.")
+    end
     get(a.source, "metadata_status", "") == "retrieved" ||
         push!(limitations, "Reference metadata from the BOLD portal are missing " *
                            "(identified_by, reference sequences); attribution and identical-sequence checks are incomplete.")

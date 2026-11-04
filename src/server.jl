@@ -91,7 +91,10 @@ mutable struct _App
     listener::Any
 end
 
-const _APP = Ref{Union{Nothing,_App}}(nothing)
+const _APP = Ref{Union{Nothing,_App}}(nothing)   # the running instance, if any
+# Instances by listener, so that `shutdown` acts only on its own server.
+const _APPS = IdDict{Any,_App}()
+const _APPS_LOCK = ReentrantLock()
 
 # Runs the queued jobs one at a time. After `shutdown` the jobs still queued
 # are cancelled; the running one completes and is recorded. The store is
@@ -110,6 +113,8 @@ function _worker_loop(app::_App)
         end
     finally
         close(app.store)
+        app.listener === nothing || lock(() -> delete!(_APPS, app.listener), _APPS_LOCK)
+        _APP[] === app && (_APP[] = nothing)
     end
 end
 
@@ -129,20 +134,26 @@ function _keep!(dict, order, key, value, max_kept)
     end
 end
 
-# Jobs are evicted only once finished (oldest first): queued and running jobs
-# stay reachable. Call with `app.lock` held.
+# Adds a job and evicts the oldest finished jobs beyond `max_kept`. Queued
+# and running jobs are never evicted and are not counted, nor is `keep` (the
+# job just added or completed), so a result returned to a client stays
+# reachable. Call with `app.lock` held.
 function _keep_job!(app::_App, job::_Job)
     app.jobs[job.id] = job
     push!(app.job_order, job.id)
-    excess = length(app.job_order) - app.max_kept
-    excess > 0 || return
+    _evict!(app, job)
+end
+
+function _evict!(app::_App, keep::_Job)
+    n = count(id -> _finished(app.jobs[id]), app.job_order)
+    n > app.max_kept || return
     for id in copy(app.job_order)
-        excess > 0 || break
-        if _finished(app.jobs[id])
-            delete!(app.jobs, id)
-            filter!(!=(id), app.job_order)
-            excess -= 1
-        end
+        n > app.max_kept || break
+        j = app.jobs[id]
+        (_finished(j) && j !== keep) || continue
+        delete!(app.jobs, id)
+        filter!(!=(id), app.job_order)
+        n -= 1
     end
 end
 
@@ -163,6 +174,13 @@ end
 
 _num(x, name, lo, hi) = (x isa Real && !(x isa Bool) && isfinite(x) && lo <= x <= hi) ? x :
     throw(_RequestError(400, "$name must be a number within [$lo, $hi]"))
+# Whole numbers only (2 and 2.0 are accepted, 1.5 is refused, never rounded).
+function _int(x, name, lo, hi)
+    v = (x isa Real && !(x isa Bool) && isfinite(x) && isinteger(x)) ? x :
+        throw(_RequestError(400, "$name must be a whole number within [$lo, $hi]"))
+    lo <= v <= hi || throw(_RequestError(400, "$name must be a whole number within [$lo, $hi]"))
+    return Int(v)
+end
 
 # LCA parameters of a request: the server defaults, overridden by the fields
 # present in `params`.
@@ -178,9 +196,9 @@ function _params_from(p, d::LCAParams)
     haskey(q, :min_identity) && (kw[:min_identity] = _num(q[:min_identity], "min_identity", 0, 100))
     haskey(q, :min_coverage) && (kw[:min_coverage] = _num(q[:min_coverage], "min_coverage", 0, 100))
     haskey(q, :max_delta) && (kw[:max_delta] = _num(q[:max_delta], "max_delta", 0, 100))
-    haskey(q, :max_matches) && (kw[:max_matches] = Int(_num(q[:max_matches], "max_matches", 1, 1000)))
+    haskey(q, :max_matches) && (kw[:max_matches] = _int(q[:max_matches], "max_matches", 1, 1000))
     haskey(q, :min_align_length) &&
-        (kw[:min_align_length] = Int(_num(q[:min_align_length], "min_align_length", 0, 100_000)))
+        (kw[:min_align_length] = _int(q[:min_align_length], "min_align_length", 0, 100_000))
     if haskey(q, :min_agreement)
         v = _num(q[:min_agreement], "min_agreement", 0, 100)
         v > 50 || throw(_RequestError(400, "min_agreement must be above 50 (a strict majority)"))
@@ -275,6 +293,11 @@ function _handle_analyze(app)
     return _json(200, (id = job.id, status = job.status))
 end
 
+_record_note(rec) = rec.reason == "incomplete" ?
+    "Not recorded in the usage statistics: BOLD did not return the result of some sequence(s); " *
+    "run the analysis again to query them" :
+    "Same analysis already recorded ($(rec.analysis_id)): usage counters not incremented"
+
 function _run_job!(app, job)
     job.status = :running
     note(msg) = lock(() -> push!(job.messages, msg), app.lock)
@@ -285,17 +308,23 @@ function _run_job!(app, job)
                          engine = app.engine(), checkpoint = app.checkpoint,
                          portal_url = app.portal_url, progress = note)
         rec = record_analysis!(app.store, a)
-        rec.recorded || note("Same analysis already recorded ($(rec.analysis_id)): usage counters not incremented")
+        rec.recorded || note(_record_note(rec))
         foreach(note, a.errors)
-        job.analysis = a
-        job.recorded = rec
-        job.status = :done
-        note("Finished")
+        lock(app.lock) do
+            job.analysis = a
+            job.recorded = rec
+            job.status = :done
+            push!(job.messages, "Finished")
+            _evict!(app, job)
+        end
     catch err
         err isa InterruptException && rethrow()
         @error "Analysis failed" exception = (err, catch_backtrace())
-        job.error = first(sprint(showerror, err), 2000)
-        job.status = :failed
+        lock(app.lock) do
+            job.error = first(sprint(showerror, err), 2000)
+            job.status = :failed
+            _evict!(app, job)
+        end
     end
 end
 
@@ -325,11 +354,11 @@ function _handle_reanalyze(app)
     msgs = ["LCA recomputed on the data downloaded by analysis $(src.id) (no BOLD request)"]
     rec = if record
         r = record_analysis!(app.store, a)
-        r.recorded || push!(msgs, "Same analysis already recorded ($(r.analysis_id)): usage counters not incremented")
+        r.recorded || push!(msgs, _record_note(r))
         r
     else
         push!(msgs, "Not recorded in the usage statistics")
-        (analysis_id = a.id, recorded = false, n_events = 0)
+        (analysis_id = a.id, recorded = false, n_events = 0, reason = "not_requested")
     end
     push!(msgs, "Finished")
     job = _Job(string(uuid4()), :done, msgs, nothing, a, rec, request, src.input)
@@ -508,7 +537,8 @@ respected by `BOLDassignment.IDEngine`). Raw BOLD results are stored in
 every analysis can change them. At most
 `max_pending` analyses may be queued or running (further requests get HTTP
 503). Uploads and finished analyses are kept in memory (the last
-`max_kept`); queued and running analyses are never evicted. Analyses and
+`max_kept` of each, always including the analysis just returned); queued and
+running analyses are never evicted. Analyses and
 events are stored in the database.
 
 With `async = false` the call blocks until Ctrl-C; with `async = true` it
@@ -523,38 +553,53 @@ function serve(; database::AbstractString = "boldtrace.sqlite", host::AbstractSt
                max_records::Integer = 100_000, max_connections::Integer = 64,
                allowed_hosts = String[], max_kept::Integer = 50, max_pending::Integer = 20,
                defaults::LCAParams = LCAParams(), accept_rank::Symbol = :phylum)
+    # Arguments are checked before any resource (database, worker, port) is taken.
     accept_rank in defaults.ranks || throw(ArgumentError("accept_rank :$accept_rank is not a rank"))
     max_kept >= 1 || throw(ArgumentError("max_kept must be at least 1"))
     max_pending >= 1 || throw(ArgumentError("max_pending must be at least 1"))
+    max_body >= 1 || throw(ArgumentError("max_body must be at least 1"))
+    max_records >= 1 || throw(ArgumentError("max_records must be at least 1"))
+    max_connections >= 1 || throw(ArgumentError("max_connections must be at least 1"))
+    0 <= port <= 65535 || throw(ArgumentError("port must be within [0, 65535]"))
+    all(h -> h isa AbstractString, allowed_hosts) ||
+        throw(ArgumentError("allowed_hosts must be a list of host names (strings)"))
+    hosts = Set{String}(lowercase(strip(String(h))) for h in allowed_hosts)
     old = _APP[]
     old === nothing || old.stopping[] ||
         throw(ArgumentError("a BOLDTrace server is already running in this session; call shutdown first"))
     ip = string(Sockets.getaddrinfo(host))
     _check_port(ip, Int(port))
     store = open_store(database)
-    app = _App(store, engine, checkpoint === nothing ? nothing : abspath(checkpoint),
-               String(portal_url), Dict(), String[], Dict(), String[], Channel{_Job}(Inf),
-               ReentrantLock(), Int(max_records), Int(max_kept), Int(max_pending), defaults,
-               accept_rank,
-               Threads.Atomic{Bool}(false), nothing, nothing)
-    app.worker = errormonitor(Threads.@spawn _worker_loop(app))
-    _APP[] = app
-    Genie.config.app_env = "prod"
-    Genie.config.server_document_root = mktempdir()
-    Genie.config.server_handle_static_files = false
-    Genie.config.server_signature = ""
-    Genie.config.log_requests = false
-    Genie.config.websockets_server = false
-    _register_routes(app)
-    hosts = Set{String}(lowercase(strip(String(h))) for h in allowed_hosts)
+    app = nothing
     listener = try
+        app = _App(store, engine, checkpoint === nothing ? nothing : abspath(checkpoint),
+                   String(portal_url), Dict(), String[], Dict(), String[], Channel{_Job}(Inf),
+                   ReentrantLock(), Int(max_records), Int(max_kept), Int(max_pending), defaults,
+                   accept_rank,
+                   Threads.Atomic{Bool}(false), nothing, nothing)
+        app.worker = errormonitor(Threads.@spawn _worker_loop(app))
+        _APP[] = app
+        Genie.config.app_env = "prod"
+        Genie.config.server_document_root = mktempdir()
+        Genie.config.server_handle_static_files = false
+        Genie.config.server_signature = ""
+        Genie.config.log_requests = false
+        Genie.config.websockets_server = false
+        _register_routes(app)
         HTTP.listen!(_stream_handler(hosts, Int(max_body)), parse(Sockets.IPAddr, ip), Int(port);
                      max_connections = Int(max_connections))
     catch
-        _stop!(app; timeout = Inf)
+        # Nothing may stay behind a failed start: the worker closes the store.
+        if app === nothing || app.worker === nothing
+            close(store)
+        else
+            _stop!(app; timeout = Inf)
+        end
+        app !== nothing && _APP[] === app && (_APP[] = nothing)
         rethrow()
     end
     app.listener = listener
+    lock(() -> (_APPS[listener] = app), _APPS_LOCK)
     server = Genie.Server.ServersCollection(webserver = listener)
     @info "BOLDTrace at http://$(host == "0.0.0.0" ? "localhost" : host):$port (database $(abspath(database)))"
     async && return server
@@ -562,6 +607,7 @@ function serve(; database::AbstractString = "boldtrace.sqlite", host::AbstractSt
         _wait(listener)
     finally
         _stop!(app; timeout = Inf)
+        lock(() -> delete!(_APPS, listener), _APPS_LOCK)
     end
     return server
 end
@@ -629,11 +675,15 @@ refused at once; analyses still queued are cancelled; the running analysis,
 if any, is completed and recorded, then the database is closed. Waits at
 most `timeout` seconds for the running analysis and returns whether
 everything has stopped; after a timeout the database is closed as soon as
-the analysis ends.
+the analysis ends. It acts only on the instance started by `server`: calling
+it again, or after another `serve`, never stops a later server.
 """
 function shutdown(server::Genie.Server.ServersCollection; timeout::Real = Inf)
+    listener = server.webserver
+    app = lock(() -> listener === nothing ? nothing : get(_APPS, listener, nothing), _APPS_LOCK)
     Genie.Server.down(server)
-    app = _APP[]
-    app === nothing && return true
-    return _stop!(app; timeout)
+    app === nothing && return true   # not a BOLDTrace server, or already stopped
+    done = _stop!(app; timeout)
+    done && lock(() -> delete!(_APPS, listener), _APPS_LOCK)
+    return done
 end

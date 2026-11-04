@@ -11,7 +11,7 @@ export LCAParams, Match, LCAResult, MatchDecision, lca, LCA_VERSION, DEFAULT_RAN
        DEFAULT_RANK_THRESHOLDS
 
 "Version of the LCA algorithm, recorded in every analysis report."
-const LCA_VERSION = "1.1.0"
+const LCA_VERSION = "1.1.1"
 
 "Ranks from the most general to the most specific."
 const DEFAULT_RANKS = (:phylum, :class, :order, :family, :genus, :species)
@@ -48,9 +48,11 @@ Parameters of [`lca`](@ref):
   references (probable misidentifications in the database): they are
   flagged as dissenting and leave the deeper ranks. Must be above 50 (a
   strict majority); ties for the most frequent name always stop;
-- `rank_cap`: when true, the assignment cannot go deeper than the deepest rank
-  whose `rank_thresholds` value the best admissible identity reaches (e.g. no
-  species below 97 %), even if the LCA set agrees further.
+- `rank_cap`: when true, the assignment stops above the first rank (from the
+  top) whose `rank_thresholds` value the best admissible identity does not
+  reach (e.g. no species below 97 %), even if the LCA set agrees further. The
+  lineage never skips a rank, also with thresholds that do not increase with
+  depth.
 """
 struct LCAParams
     min_identity::Float64
@@ -126,6 +128,8 @@ end
     LCAResult
 
 - `status`: `:assigned`, `:no_matches` (nothing retrieved),
+  `:result_missing` (set by the analysis, never by `lca`: BOLD did not return
+  the result of the sequence, so its matches are unknown),
   `:no_admissible_match` (all matches filtered out) or `:unresolved` (the
   LCA set does not agree even at the first rank);
 - `taxon`, `rank`: deepest assigned taxon and its rank (`nothing` unless
@@ -311,11 +315,14 @@ function lca(matches::AbstractVector{Match}, params::LCAParams = LCAParams();
     lca_rank = isempty(lineage) ? nothing : first(last(lineage))
     capped = false
     if params.rank_cap && !isempty(lineage)
-        allowed = [p for p in lineage if best.identity >= params.rank_thresholds[first(p)]]
-        if length(allowed) < length(lineage)
+        # Truncate at the first rank whose threshold is not met, so that the
+        # lineage never skips a rank and each rank keeps its own agreement
+        # (thresholds that are not monotone cannot create gaps).
+        k = findfirst(p -> best.identity < params.rank_thresholds[first(p)], lineage)
+        if k !== nothing
             capped = true
-            lineage = allowed
-            agreement = agreement[1:length(allowed)]
+            lineage = lineage[1:k-1]
+            agreement = agreement[1:k-1]
         end
     end
     if isempty(lineage)

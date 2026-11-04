@@ -346,7 +346,8 @@ end
     b = reanalyze(a; params = LCAParams(; min_agreement = 60))
     @test length(f.requests) == n_requests              # no BOLD or portal request
     @test b.id != a.id && b.fingerprint != a.fingerprint
-    @test b.source["reanalysis_of"] == a.id && b.source["retrieved_at"] == a.source["retrieved_at"]
+    @test b.source["reanalysis_of"] == a.id && b.source["hits_retrieval"] == a.source["hits_retrieval"] &&
+          b.source["analysis_run_at"] == a.source["analysis_run_at"]
     @test provenance(b)["reanalysis_of"] == a.id && provenance(a)["reanalysis_of"] === nothing
     rows = Dict(r.asv_id => r for r in assignment_table(b))
     @test rows["A1"].taxon == "Onthophagus taurus" && rows["A2"].taxon == "Caccobius schreberi"
@@ -560,6 +561,36 @@ end
     end
 end
 
+# Server with an engine factory held by a gate: the first job stays running.
+function gated_server(dir; kwargs...)
+    f = FakeBOLD(catalog, portal)
+    gate = Channel{Nothing}(Inf)
+    port = 19000 + rand(0:999)
+    server = serve(; database = joinpath(dir, "gate.sqlite"), port, async = true,
+                   engine = () -> (take!(gate); fake_engine(f)), checkpoint = nothing,
+                   portal_url = "https://portal.test", kwargs...)
+    return server, gate, "http://127.0.0.1:$port"
+end
+req(base, method, path; body = nothing) =
+    HTTP.request(method, base * path, body === nothing ? [] : ["Content-Type" => "application/json"],
+                 body === nothing ? UInt8[] : body; status_exception = false, retry = false,
+                 readtimeout = 120)
+jsonof(r) = JSON3.read(String(r.body))
+function start_job(base, token, project)
+    r = req(base, "POST", "/api/analyze"; body = JSON3.write((token = token, project = project)))
+    return r.status == 200 ? jsonof(r)[:id] : r.status
+end
+status(base, id) = (r = req(base, "GET", "/api/job?id=$id"); r.status == 200 ? jsonof(r)[:status] : r.status)
+function wait_status(base, id, wanted; tries = 300)
+    s = nothing
+    for _ in 1:tries
+        s = status(base, id)
+        s in wanted && return s
+        sleep(0.1)
+    end
+    return s
+end
+
 @testset "Review regressions BT1-BT5" begin
     # BT5: coverage and length outside their domain are rejected.
     for cov in (NaN, Inf, -Inf, 101.0, -1.0)
@@ -602,36 +633,6 @@ end
     @test usage_stats(store; project = "other").n_analyses == 0
     close(store)
 
-    # Server with an engine factory held by a gate: the first job stays running.
-    function gated_server(dir; kwargs...)
-        f = FakeBOLD(catalog, portal)
-        gate = Channel{Nothing}(Inf)
-        port = 19000 + rand(0:999)
-        server = serve(; database = joinpath(dir, "gate.sqlite"), port, async = true,
-                       engine = () -> (take!(gate); fake_engine(f)), checkpoint = nothing,
-                       portal_url = "https://portal.test", kwargs...)
-        return server, gate, "http://127.0.0.1:$port"
-    end
-    req(base, method, path; body = nothing) =
-        HTTP.request(method, base * path, body === nothing ? [] : ["Content-Type" => "application/json"],
-                     body === nothing ? UInt8[] : body; status_exception = false, retry = false,
-                     readtimeout = 120)
-    jsonof(r) = JSON3.read(String(r.body))
-    function start_job(base, token, project)
-        r = req(base, "POST", "/api/analyze"; body = JSON3.write((token = token, project = project)))
-        return r.status == 200 ? jsonof(r)[:id] : r.status
-    end
-    status(base, id) = (r = req(base, "GET", "/api/job?id=$id"); r.status == 200 ? jsonof(r)[:status] : r.status)
-    function wait_status(base, id, wanted; tries = 300)
-        s = nothing
-        for _ in 1:tries
-            s = status(base, id)
-            s in wanted && return s
-            sleep(0.1)
-        end
-        return s
-    end
-
     # BT2: running and queued jobs are not evicted; the queue is bounded.
     dir = mktempdir()
     server, gate, base = gated_server(dir; max_kept = 1, max_pending = 2)
@@ -643,8 +644,9 @@ end
         @test status(base, id1) == "running"          # not evicted by the second job
         @test status(base, id2) == "queued"
         @test start_job(base, token, "p3") == 503     # max_pending reached
-        put!(gate, nothing); put!(gate, nothing)
+        put!(gate, nothing)
         @test wait_status(base, id1, ("done", "failed")) == "done"
+        put!(gate, nothing)
         @test wait_status(base, id2, ("done", "failed")) == "done"
         # Finished jobs are evicted beyond max_kept.
         put!(gate, nothing)
@@ -676,6 +678,326 @@ end
     @test usage_stats(store).n_analyses == 1 && usage_stats(store; project = "q1").n_events == 8
     close(store)
     @test BOLDTrace._APP[] === nothing || BOLDTrace._APP[].stopping[]
+end
+
+
+@testset "Review regressions BT6-BT9" begin
+    # BT6: thresholds that do not increase with depth never leave a gap in
+    # the lineage, and each rank keeps its own agreement.
+    hits = vcat([m("t$k", 98, lineage()) for k in 1:8],
+                [m("i", 98, lineage(species = "Onthophagus illyricus")),
+                 m("c", 98, lineage(genus = "Caccobius", species = "Caccobius schreberi"))])
+    th = merge(LCA.DEFAULT_RANK_THRESHOLDS, Dict(:genus => 99.0, :species => 97.0))
+    p = LCAParams(; min_agreement = 80, rank_thresholds = th)
+    r = lca(hits, p; valid_name = valid)
+    @test (r.status, r.taxon, r.rank, r.lca_rank, r.rank_capped) ==
+          (:assigned, "Scarabaeidae", :family, :species, true)
+    @test first.(r.lineage) == p.ranks[1:4]
+    @test length(r.agreement) == length(r.lineage) && all(==(100.0), r.agreement)
+    # Without the cap the same hits reach the species with its own agreement.
+    r = lca(hits, LCAParams(; min_agreement = 80, rank_cap = false); valid_name = valid)
+    @test r.rank == :species && r.agreement[5:6] ≈ [90.0, 800 / 9]
+    # With the default thresholds the result is unchanged.
+    r = lca(hits, LCAParams(; min_agreement = 80); valid_name = valid)
+    @test r.rank == :species && !r.rank_capped && r.agreement[6] ≈ 800 / 9
+    # Gap in the middle: only the ranks above the first failing one remain.
+    th = merge(LCA.DEFAULT_RANK_THRESHOLDS, Dict(:order => 99.0))
+    r = lca([m("a", 98, lineage())], LCAParams(; rank_thresholds = th); valid_name = valid)
+    @test (r.taxon, r.rank) == ("Insecta", :class) && length(r.agreement) == 2
+
+    # BT7: a recomputed result stays reachable while another analysis runs;
+    # finished analyses are evicted when they complete.
+    dir = mktempdir()
+    server, gate, base = gated_server(dir; max_kept = 1, max_pending = 2)
+    try
+        token = jsonof(req(base, "POST", "/api/upload"; body = JSON3.write((fasta = fasta,))))[:token]
+        put!(gate, nothing)
+        ida = start_job(base, token, "a")
+        @test wait_status(base, ida, ("done", "failed")) == "done"
+        idb = start_job(base, token, "b")
+        @test wait_status(base, idb, ("running",)) == "running"
+        r = req(base, "POST", "/api/reanalyze"; body = JSON3.write((id = ida, params = (min_agreement = 80,))))
+        @test r.status == 200
+        rj = jsonof(r)
+        idc = rj[:id]
+        @test rj[:status] == "done"
+        @test req(base, "GET", "/api/assignments?id=$idc").status == 200
+        @test status(base, idb) == "running"
+        put!(gate, nothing)
+        @test wait_status(base, idb, ("done", "failed")) == "done"
+        @test req(base, "GET", "/api/assignments?id=$idb").status == 200
+        @test status(base, idc) == 404              # evicted when B completed
+        app = BOLDTrace._APP[]
+        @test lock(() -> length(app.jobs), app.lock) == 1
+    finally
+        put!(gate, nothing)
+        @test shutdown(server)
+    end
+
+    # BT8: an old handle never stops a later server; shutdown is idempotent.
+    server_a, gate_a, base_a = gated_server(mktempdir())
+    @test shutdown(server_a)
+    server_b, gate_b, base_b = gated_server(mktempdir())
+    try
+        app_b = BOLDTrace._APP[]
+        @test shutdown(server_a)
+        @test BOLDTrace._APP[] === app_b && !app_b.stopping[] && isopen(app_b.store.db)
+        @test req(base_b, "GET", "/health").status == 200
+        put!(gate_b, nothing)
+        token = jsonof(req(base_b, "POST", "/api/upload"; body = JSON3.write((fasta = fasta,))))[:token]
+        id = start_job(base_b, token, "b")
+        @test id isa AbstractString
+        @test wait_status(base_b, id, ("done", "failed")) == "done"
+    finally
+        put!(gate_b, nothing)
+        @test shutdown(server_b)
+        @test shutdown(server_b)                     # again: nothing to do
+    end
+    @test BOLDTrace._APP[] === nothing
+    @test isempty(BOLDTrace._APPS)
+
+    # BT9: counts of an analysis do not change when later analyses update
+    # the reference metadata.
+    path = joinpath(mktempdir(), "snapshot.sqlite")
+    store = open_store(path)
+    a, _ = scenario(; project = "pA")
+    @test record_analysis!(store, a).recorded
+    before = usage_stats(store; analysis_id = a.id)
+    portal2 = copy(portal)
+    portal2["P2"] = [doc("P2", "COI-5P", nuc(2), "A. Rossi")]      # sequence updated in BOLD
+    input = read_asvs(Vector{UInt8}(codeunits(fasta)); name = "asvs.fasta")
+    b = run_analysis(input; project = "pB", engine = fake_engine(FakeBOLD(catalog, portal2)),
+                     portal_url = "https://portal.test")
+    @test record_analysis!(store, b).recorded
+    @test usage_stats(store; analysis_id = a.id) == before
+    @test usage_stats(store; analysis_id = b.id).n_reference_sequences ==
+          before.n_reference_sequences + 1
+    n_ref(id) = BOLDTrace._scalar(store.db,
+        "SELECT COUNT(DISTINCT ref_sequence_hash) FROM identification_events WHERE analysis_id = ?", (id,))
+    @test n_ref(a.id) == length(unique(skipmissing(r.sequence_hash for r in values(a.references))))
+    close(store)
+    # A version 1 database is migrated; old events take the catalogue values.
+    path = joinpath(mktempdir(), "v1.sqlite")
+    store = open_store(path)
+    a, _ = scenario()
+    record_analysis!(store, a)
+    stats = usage_stats(store)
+    for col in first.(BOLDTrace._SNAPSHOT_COLUMNS)
+        BOLDTrace.DBInterface.execute(store.db, "ALTER TABLE identification_events DROP COLUMN $col")
+    end
+    BOLDTrace.DBInterface.execute(store.db, "UPDATE schema_info SET version = 1")
+    close(store)
+    store = open_store(path)
+    @test BOLDTrace._scalar(store.db, "SELECT MAX(version) FROM schema_info") == BOLDTrace.SCHEMA_VERSION
+    @test usage_stats(store) == stats
+    @test BOLDTrace._scalar(store.db,
+        "SELECT COUNT(*) FROM identification_events WHERE ref_identified_by = 'A. Rossi'") > 0
+    close(store)
+end
+
+
+@testset "Review regressions BT10-BT12" begin
+    # BT10: hits reused from the checkpoint keep their original date; mixed runs
+    # report the origin of every sequence.
+    ckpt = mktempdir()
+    input = read_asvs(Vector{UInt8}(codeunits(fasta)); name = "asvs.fasta")
+    f1 = FakeBOLD(catalog, portal)
+    a = run_analysis(input; engine = fake_engine(f1), checkpoint = ckpt, metadata = false,
+                     portal_url = "https://portal.test")
+    hr = a.source["hits_retrieval"]
+    n = length(input.unique)
+    @test (hr["n_from_bold"], hr["n_from_checkpoint"]) == (n, 0)
+    @test !a.source["checkpoint_used"] && a.source["checkpoint_configured"]
+    @test all(v -> v["source"] == "bold_identification_engine", values(hr["by_sequence"]))
+    @test hr["checkpoint_oldest"] === nothing && a.source["metadata_retrieved_at"] === nothing
+    first_run = (a.source["analysis_run_at"], hr["retrieved_at"])
+    sleep(1.1)
+    f2 = FakeBOLD(catalog, portal)
+    b = run_analysis(input; engine = fake_engine(f2), checkpoint = ckpt, metadata = false,
+                     portal_url = "https://portal.test")
+    @test isempty(f2.requests)                         # nothing asked to BOLD
+    hr = b.source["hits_retrieval"]
+    @test (hr["n_from_bold"], hr["n_from_checkpoint"]) == (0, n)
+    @test hr["retrieved_at"] === nothing && b.source["checkpoint_used"]
+    # Dates of the first download (ISO strings compare chronologically).
+    @test first_run[1] <= hr["checkpoint_oldest"] <= hr["checkpoint_newest"] <= first_run[2]
+    @test all(v -> v["source"] == "checkpoint" && first_run[1] <= v["retrieved_at"] <= first_run[2],
+              values(hr["by_sequence"]))
+    @test b.source["analysis_run_at"] > first_run[2]
+    lim = provenance(b)["limitations"]
+    @test any(l -> occursin("reused from the local checkpoint", l) &&
+                   occursin(hr["checkpoint_oldest"], l), lim)
+    @test !any(l -> occursin("reused from the local checkpoint", l), provenance(a)["limitations"])
+    # Mixed batch: one new sequence is queried, the others are reused.
+    s5 = dna(15)
+    mixed = read_asvs(Vector{UInt8}(codeunits(fasta * ">A5\n$s5\n")); name = "mixed.fasta")
+    f3 = FakeBOLD(catalog, portal)
+    c = run_analysis(mixed; engine = fake_engine(f3), checkpoint = ckpt, metadata = true,
+                     portal_url = "https://portal.test")
+    hr = c.source["hits_retrieval"]
+    @test (hr["n_from_bold"], hr["n_from_checkpoint"]) == (1, n)
+    h5 = BOLDTrace.sequence_hash(s5)
+    @test hr["by_sequence"][h5]["source"] == "bold_identification_engine"
+    @test hr["by_sequence"][h5]["retrieved_at"] == hr["retrieved_at"]
+    @test count(v -> v["source"] == "checkpoint", values(hr["by_sequence"])) == n
+    @test c.source["metadata_retrieved_at"] isa String
+    # The JSON export carries the per-sequence origin.
+    pj = JSON3.read(export_file(c, "analysis_provenance.json"))
+    @test pj[:bold_data_source][:hits_retrieval][:by_sequence][Symbol(h5)][:source] ==
+          "bold_identification_engine"
+
+    # BT12: fractional integer parameters are refused with 400, never rounded.
+    dir = mktempdir()
+    server, gate, base = gated_server(dir)
+    try
+        token = jsonof(req(base, "POST", "/api/upload"; body = JSON3.write((fasta = fasta,))))[:token]
+        for (k, v) in (("max_matches", 1.5), ("min_align_length", 1.5), ("max_matches", 0),
+                       ("max_matches", "10"), ("min_align_length", true))
+            r = req(base, "POST", "/api/analyze";
+                    body = JSON3.write(Dict("token" => token, "params" => Dict(k => v))))
+            @test r.status == 400
+            @test occursin(k, jsonof(r)[:error])
+        end
+        @test lock(() -> isempty(BOLDTrace._APP[].jobs), BOLDTrace._APP[].lock)
+        put!(gate, nothing)
+        r = req(base, "POST", "/api/analyze";
+                body = JSON3.write(Dict("token" => token, "params" => Dict("max_matches" => 10.0))))
+        @test r.status == 200                          # a whole number written as 10.0
+        id = jsonof(r)[:id]
+        @test wait_status(base, id, ("done", "failed")) == "done"
+        r = req(base, "POST", "/api/reanalyze";
+                body = JSON3.write(Dict("id" => id, "params" => Dict("min_align_length" => 2.5))))
+        @test r.status == 400
+    finally
+        put!(gate, nothing)
+        @test shutdown(server)
+    end
+end
+
+
+@testset "Review regressions BT13-BT15" begin
+    # BT13: a result that BOLD did not return is not "no match".
+    ckpt = mktempdir()
+    input = read_asvs(Vector{UInt8}(codeunits(fasta)); name = "asvs.fasta")
+    f = FakeBOLD(catalog, portal)
+    push!(f.omit, s3)
+    a = @test_logs (:warn, r"without the result of 1 sequence") match_mode = :any run_analysis(
+        input; engine = fake_engine(f), checkpoint = ckpt, portal_url = "https://portal.test")
+    st = Dict(u.ids[1] => a.results[i] for (i, u) in enumerate(input.unique))
+    @test st["A3"].status == :result_missing && "bold_result_missing" in st["A3"].flags
+    @test st["A4"].status == :no_matches                 # explicit empty result: no match
+    @test st["A1"].status == :assigned
+    @test count(e -> occursin("did not return the result of 1 sequence(s) (A3)", e), a.errors) == 1
+    @test any(e -> occursin("result_missing", e), provenance(a)["errors"])
+    h3 = sequence_hash(s3)
+    hr = a.source["hits_retrieval"]
+    @test hr["by_sequence"][h3]["source"] == "missing_from_bold_result"
+    @test hr["by_sequence"][h3]["retrieved_at"] === nothing
+    @test (hr["n_from_bold"], hr["n_missing_from_bold"]) == (length(input.unique) - 1, 1)
+    rows = Dict(r.asv_id => r for r in assignment_table(a))
+    @test rows["A3"].status == "result_missing" && !rows["A3"].accepted
+    @test analysis_summary(a).status["result_missing"] == 1
+    # Recomputing keeps the status and does not repeat the error.
+    b = reanalyze(a; params = LCAParams(; min_agreement = 60))
+    @test b.results[findfirst(u -> u.hash == h3, input.unique)].status == :result_missing
+    @test count(e -> occursin("did not return", e), b.errors) == 1
+    # Not checkpointed: the next run queries it and assigns it.
+    empty!(f.omit)
+    c = run_analysis(input; engine = fake_engine(f), checkpoint = ckpt, portal_url = "https://portal.test")
+    @test c.results[findfirst(u -> u.hash == h3, input.unique)].taxon == "Aphodius"
+    @test !any(e -> occursin("did not return", e), c.errors)
+    hr = c.source["hits_retrieval"]
+    @test (hr["n_from_bold"], hr["n_from_checkpoint"], hr["n_missing_from_bold"]) ==
+          (1, length(input.unique) - 1, 0)
+    # Incomplete analyses are not recorded; the complete run then is.
+    @test is_incomplete(a) && is_incomplete(b) && !is_incomplete(c)
+    @test c.fingerprint == a.fingerprint            # same input and parameters
+    store = open_store()
+    r = record_analysis!(store, a)
+    @test (r.recorded, r.reason, r.n_events) == (false, "incomplete", 0)
+    @test usage_stats(store).n_analyses == 0 && usage_stats(store).n_events == 0
+    @test occursin("Not recorded", BOLDTrace._record_note(r))
+    @test record_analysis!(store, b).reason == "incomplete"
+    r = record_analysis!(store, c)
+    @test (r.recorded, r.reason) == (true, "recorded")
+    r = record_analysis!(store, c)
+    @test (r.recorded, r.reason) == (false, "duplicate")
+    @test occursin("already recorded", BOLDTrace._record_note(r))
+    @test usage_stats(store).n_analyses == 1
+    close(store)
+    # Hits tables without the column (older BOLDassignment) keep working.
+    old = select(a.hits, Not(:result_received))
+    d = analyze_hits(input, old, a.records)
+    @test d.results[findfirst(u -> u.hash == h3, input.unique)].status == :no_matches
+
+    # BT15: a failed start leaves nothing behind and does not block the next one.
+    @test BOLDTrace._APP[] === nothing
+    dir = mktempdir()
+    for bad in ((allowed_hosts = [123],), (max_body = 0,), (max_connections = 0,), (port = 70000,))
+        @test_throws ArgumentError serve(; database = joinpath(dir, "x.sqlite"), port = 19500,
+                                         async = true, checkpoint = nothing, bad...)
+        @test BOLDTrace._APP[] === nothing && isempty(BOLDTrace._APPS)
+    end
+    server, gate, base = gated_server(dir)
+    try
+        @test req(base, "GET", "/health").status == 200
+    finally
+        @test shutdown(server)
+    end
+    @test BOLDTrace._APP[] === nothing
+end
+
+
+@testset "Review regressions BT16" begin
+    # One reference classified differently by two hits of the same analysis
+    # (old checkpoint vs new query): each hit keeps its own classification.
+    sx = dna(31)
+    sy = (sx[1] == 'A' ? "C" : "A") * sx[2:end]        # one base different
+    taurus, illyricus = tax("Onthophagus", "Onthophagus taurus"), tax("Onthophagus", "Onthophagus illyricus")
+    ckpt = mktempdir()
+    old_catalog = Dict{String,Vector{Any}}(sx => [("P1", "COI-5P", 0.0, 100, 150, taurus)])
+    new_catalog = Dict{String,Vector{Any}}(sx => [("P1", "COI-5P", 0.0, 100, 150, illyricus)],
+                                           sy => [("P1", "COI-5P", 0.7, 100, 150, illyricus)])
+    asvs(order) = read_asvs(Vector{UInt8}(codeunits(join((">$id\n$sq\n" for (id, sq) in order)))))
+    run_analysis(asvs([("X", sx)]); engine = fake_engine(FakeBOLD(old_catalog, portal)),
+                 checkpoint = ckpt, portal_url = "https://portal.test")
+    function mixed(order)
+        f = FakeBOLD(new_catalog, portal)
+        a = run_analysis(asvs(order); engine = fake_engine(f), checkpoint = ckpt,
+                         portal_url = "https://portal.test")
+        return a
+    end
+    a = mixed([("X", sx), ("Y", sy)])
+    @test a.source["hits_retrieval"]["n_from_checkpoint"] == 1
+    hit_species(a) = Dict(r.asv_ids => (r.ref_species, r.final_taxon, r.supports_assignment)
+                          for r in match_table(a) if r.process_id == "P1")
+    @test hit_species(a) == Dict("X" => ("Onthophagus taurus", "Onthophagus taurus", true),
+                                 "Y" => ("Onthophagus illyricus", "Onthophagus illyricus", true))
+    @test all(r -> "reference_classification_conflict" in r.flags, a.results)
+    @test count(e -> startswith(e, "Warning: BOLD classified 1 reference record(s) differently") &&
+                     occursin("P1 (Onthophagus taurus vs Onthophagus illyricus)", e), a.errors) == 1
+    @test length(only(values(reference_conflicts(a)))) == 2
+    ru = only(r for r in reference_usage(a) if r.process_id == "P1")
+    @test ru.taxon == "Onthophagus illyricus | Onthophagus taurus" && ru.rank == "species"
+    @test only(taxonomic_attribution(a)).n_taxa == 2
+    # Independent of the FASTA order.
+    b = mixed([("Y", sy), ("X", sx)])
+    @test hit_species(b) == hit_species(a)
+    @test only(r for r in reference_usage(b) if r.process_id == "P1").taxon == ru.taxon
+    # Event snapshots keep the classification of each hit.
+    store = open_store()
+    record_analysis!(store, a)
+    q = Dict(String(r.asv) => String(r.ref_taxon) for r in BOLDTrace.DBInterface.execute(store.db,
+        """SELECT r.asv_ids AS asv, e.ref_taxon FROM identification_events e
+           JOIN asv_results r ON r.analysis_id = e.analysis_id AND r.sequence_hash = e.sequence_hash"""))
+    @test q == Dict("X" => "Onthophagus taurus", "Y" => "Onthophagus illyricus")
+    close(store)
+    # Recomputing does not repeat the warning; consistent analyses have no flag.
+    c = reanalyze(a)
+    @test count(e -> startswith(e, "Warning: BOLD classified"), c.errors) == 1
+    d, _ = scenario()
+    @test isempty(reference_conflicts(d))
+    @test !any(r -> "reference_classification_conflict" in r.flags, d.results)
 end
 
 end

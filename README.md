@@ -61,9 +61,11 @@ opens `http://127.0.0.1:8080` with seven sections:
 server; `serve(...; async = true)` returns it for `shutdown`. Analyses run
 one at a time (the BOLD rate limits apply to the whole client); at most
 `max_pending` (20) may wait, and queued or running analyses are never
-dropped from memory. `shutdown(server; timeout = Inf)` cancels the queued
-analyses, lets the running one finish and be recorded, then closes the
-database. `serve(...; defaults = LCAParams(...), accept_rank = :genus)` sets
+dropped from memory; the last `max_kept` (50) finished analyses are kept,
+always including the one just returned. `shutdown(server; timeout = Inf)`
+cancels the queued analyses, lets the running one finish and be recorded,
+then closes the database. It acts only on the server it was given and can be
+called again safely. `serve(...; defaults = LCAParams(...), accept_rank = :genus)` sets
 the parameters proposed by the page; each analysis can still change them.
 The default host accepts only local connections and there is no authentication: on a
 shared server use a reverse proxy with HTTPS and `allowed_hosts`. Request
@@ -115,13 +117,16 @@ Checked on 2026-11-04 against the published OpenAPI documents:
   BOLDTrace uses the record of the marker of the match (e.g. `COI-5P`).
 - **Not available** from the APIs: a version or snapshot of the reference
   libraries, the alignment software and its version, bibliographic
-  information. The provenance report records the retrieval date and states
-  these limitations.
+  information. The provenance report records the retrieval dates and states
+  these limitations: the date of the run, for every sequence whether its hits
+  were queried now or reused from the checkpoint (with the date of the
+  checkpoint file, i.e. of the original download), and the date of the
+  portal metadata. Reused hits are also listed among the limitations.
 
 Per-sequence coverage is the engine's `qcovhsp` (percent of the query covered
 by the alignment); alignment length is its `length`.
 
-## LCA (`BOLDTrace.LCA`, version 1.1.0)
+## LCA (`BOLDTrace.LCA`, version 1.1.1)
 
 An independent module (`lca(matches, LCAParams(...))`, no BOLD dependency).
 For each ASV:
@@ -148,7 +153,9 @@ For each ASV:
 6. `rank_cap = true` (default) limits the rank by the identity of the best
    match: species ≥ 97, genus ≥ 95, family ≥ 90, order ≥ 85, class ≥ 75,
    phylum ≥ 50 % (as BOLDigger3/BOLDassignment), each threshold configurable
-   (`rank_thresholds`). The uncapped LCA rank is reported (`lca_rank`).
+   (`rank_thresholds`). The lineage stops above the first rank whose
+   threshold is not reached, so it never skips a rank. The uncapped LCA rank
+   is reported (`lca_rank`).
 
 Flags: `discordant:<rank>`, `majority:<rank>` (assigned with dissenting
 references), `incomplete_taxonomy:<rank>`,
@@ -156,8 +163,21 @@ references), `incomplete_taxonomy:<rank>`,
 `identical_reference_sequences` and
 `identical_reference_sequences_discordant:<rank>` (identical reference
 sequences, by hash of the portal sequence, with different names),
-`truncated_at_max_matches`. Status: `assigned`, `no_matches`,
-`no_admissible_match`, `unresolved`.
+`truncated_at_max_matches`, `reference_classification_conflict` (a
+reference record classified differently by hits of the same analysis, e.g. a
+hit reused from an older checkpoint and a new one: each hit keeps its own
+classification in the LCA, in `bold_matches.csv` and in the stored events;
+`reference_usage.csv` lists all the classifications, and the analysis
+reports a warning). Status: `assigned`, `no_matches`,
+`no_admissible_match`, `unresolved`, and `result_missing` (flag
+`bold_result_missing`) when a finished BOLD submission did not return the
+result of a sequence: its matches are unknown, which is not the same as no
+match. The analysis lists it among its errors and in the provenance
+(`hits_retrieval.by_sequence`); the sequence is not checkpointed, so running
+the analysis again queries it. An analysis with missing results is **not
+recorded** in the usage statistics (`record_analysis!` returns `reason =
+"incomplete"`), so the complete run is recorded when the missing sequences
+are retrieved.
 
 The rank is the depth of agreement among the selected references, **not** a
 statistical confidence. An assignment is *accepted* when it reaches
@@ -197,6 +217,11 @@ and parameters) is not recorded again, and event keys are unique.
 `usage_stats` reports analyses, projects, events (retrieved, in LCA sets, in
 accepted assignments), distinct ASVs, process IDs and reference sequences,
 for a project/user/analysis (personal) or for the whole database (global).
+Each event keeps a snapshot of the reference as used by its analysis
+(sequence hash, taxon, rank, `identified_by`): `bold_references` holds the
+latest metadata, but later analyses never change the counts of earlier ones.
+Databases of schema version 1 are migrated when opened; their old events
+take the snapshot from the reference catalogue at that moment.
 
 Global statistics count only the identifications recorded by this
 application, not all uses of BOLD worldwide.
@@ -222,7 +247,7 @@ necessarily document every barcode of the project.
 | `bold_matches.csv` | every (ASV, reference) match: identity, coverage, length, reference taxonomy, `identified_by`, reference sequence hash, LCA decision |
 | `reference_usage.csv` | the three counts per reference record |
 | `taxonomic_attribution.csv` | statistics per identifier |
-| `analysis_provenance.json` | analysis ID, date (UTC), input hashes, BOLD source and retrieval date, parameters, LCA and software versions, selected process IDs, assignments, limitations |
+| `analysis_provenance.json` | analysis ID, date (UTC), input hashes, BOLD source and retrieval dates (per sequence: queried or reused from the checkpoint), parameters, LCA and software versions, selected process IDs, assignments, limitations |
 | `used_process_ids.tsv` | process IDs in LCA sets, with the citation columns |
 
 Cells starting with `= + - @` get a leading apostrophe (spreadsheet formula
