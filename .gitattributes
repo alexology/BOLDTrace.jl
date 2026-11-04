@@ -1,0 +1,2 @@
+# The real BOLD response used by the tests must keep its exact bytes.
+test/data/** -text

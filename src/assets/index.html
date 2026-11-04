@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>BOLDTrace</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+      <rect x="4" y="6" width="24" height="20" rx="4" />
+      <path d="M9 11v10M12 11v10M14.5 11v10M18 11v10M21 11v10M23 11v10" />
+    </svg>
+    <div>
+      <div class="name">BOLDTrace</div>
+      <div class="tagline">ASV identification through BOLD &amp; traceability of the references used</div>
+    </div>
+  </div>
+  <dl class="stats" aria-live="polite">
+    <div><dt>Input</dt><dd id="stat-input">—</dd></div>
+    <div><dt>Unique ASVs</dt><dd id="stat-unique">—</dd></div>
+    <div><dt>Accepted</dt><dd id="stat-accepted">—</dd></div>
+    <div><dt>References in LCA</dt><dd id="stat-refs">—</dd></div>
+  </dl>
+</header>
+
+<div class="tabbar">
+<nav class="tabs" role="tablist" id="tabs" aria-label="Sections">
+  <button type="button" role="tab" data-tab="upload" aria-selected="true">Upload</button>
+  <button type="button" role="tab" data-tab="analysis" aria-selected="false">Analysis</button>
+  <button type="button" role="tab" data-tab="assignments" aria-selected="false" disabled>Assignments</button>
+  <button type="button" role="tab" data-tab="references" aria-selected="false" disabled>Reference usage</button>
+  <button type="button" role="tab" data-tab="attribution" aria-selected="false" disabled>Taxonomic attribution</button>
+  <button type="button" role="tab" data-tab="stats" aria-selected="false">Statistics</button>
+  <button type="button" role="tab" data-tab="export" aria-selected="false" disabled>Export</button>
+</nav>
+  <a class="powered" href="https://dnambientale.it/en/index.html" target="_blank" rel="noopener noreferrer"
+     title="dnambientale.it (opens in a new tab)">
+    <span class="powered-label">Powered by</span>
+    <span class="powered-logo"><img src="assets/dnambientale.png" width="22" height="20" alt=""></span>
+    <span class="powered-name">dnambientale.it</span>
+  </a>
+</div>
+
+<main class="page">
+
+<section id="tab-upload" class="tab card" role="tabpanel">
+  <div class="card-head"><h2>Upload</h2></div>
+  <div class="card-body">
+    <p class="lead">Multi-FASTA file of ASVs (nucleotides, IUPAC codes allowed). Original identifiers are kept; identical sequences are analysed once.</p>
+    <textarea id="fasta-text" rows="9" spellcheck="false" aria-label="FASTA sequences"
+              placeholder="&gt;ASV1&#10;ACTTTATATTTTATTTTTGGAATTTGAGCAGG…"></textarea>
+    <div class="input-meta">
+      <label class="file-button">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3v10m0-10L6 7m4-4 4 4M4 13v3h12v-3"/></svg>
+        Choose file
+        <input type="file" id="fasta-file" accept=".fasta,.fa,.fas,.fna,.txt">
+      </label>
+      <span class="muted" id="file-name"></span>
+      <button id="upload-btn" class="primary">Validate</button>
+    </div>
+    <div id="upload-result" hidden>
+      <div class="kpis" id="upload-kpis"></div>
+      <details id="upload-errors-box" class="advanced"><summary>Errors</summary><ul id="upload-errors" class="list error"></ul></details>
+      <details id="upload-warnings-box" class="advanced"><summary>Warnings</summary><ul id="upload-warnings" class="list"></ul></details>
+      <p class="mono small" id="upload-hash"></p>
+    </div>
+  </div>
+</section>
+
+<section id="tab-analysis" class="tab card" role="tabpanel" hidden>
+  <div class="card-head"><h2>Analysis</h2></div>
+  <div class="card-body">
+    <p class="note">Sequences are sent to the official BOLD v5 identification engine (id.boldsystems.org). The API allows 3 submissions per minute: large files take time. Metadata of the matched records (identifier, sequence, projects) come from the BOLD portal API.</p>
+    <form id="analysis-form" class="grid">
+      <label class="field">Project <input class="text-input" name="project" value="default" maxlength="200"></label>
+      <label class="field">User <input class="text-input" name="user" maxlength="200" placeholder="optional"></label>
+      <label class="field">BOLD library <select class="select" name="db" id="db-select"></select></label>
+      <label class="field">Search mode <select class="select" name="mode" id="mode-select"></select></label>
+      <label class="field">Minimum identity (%) <input class="text-input" name="min_identity" type="number" min="0" max="100" step="0.1"></label>
+      <label class="field">Minimum query coverage (%) <input class="text-input" name="min_coverage" type="number" min="0" max="100" step="1"></label>
+      <label class="field">Maximum difference from best match (points) <input class="text-input" name="max_delta" type="number" min="0" max="100" step="0.1"></label>
+      <label class="field">Maximum number of matches <input class="text-input" name="max_matches" type="number" min="1" max="1000" step="1"></label>
+      <label class="field">Minimum agreement among matches (%) <input class="text-input" name="min_agreement" type="number" min="50.1" max="100" step="0.1">
+        <span class="field-note">100 = strict LCA. E.g. 95: up to 5 % discordant references (probable misidentifications) are tolerated and reported.</span></label>
+      <label class="field">Minimum alignment length (bp, 0 = off) <input class="text-input" name="min_align_length" type="number" min="0" step="1"></label>
+      <label class="field">Accepted assignment from rank <select class="select" name="accept_rank" id="accept-select"></select></label>
+      <label class="switch wide"><input name="rank_cap" type="checkbox" checked><span class="track"></span>
+        Limit the rank by the identity of the best match</label>
+      <fieldset class="thresholds wide" id="thresholds">
+        <legend>Minimum identity of the best match (%) for each rank</legend>
+        <div class="threshold-grid" id="threshold-grid"></div>
+      </fieldset>
+    </form>
+    <div class="input-meta">
+      <span id="analyze-hint" class="muted">Validate a FASTA file first.</span>
+      <button id="analyze-btn" class="primary" disabled><span class="spinner"></span>Run analysis</button>
+    </div>
+    <div id="job-box" hidden>
+      <p class="status-line"><span class="muted">Status</span> <strong id="job-status"></strong></p>
+      <ol id="job-messages" class="list small"></ol>
+      <p id="job-error" class="error" hidden></p>
+      <div class="kpis" id="job-kpis"></div>
+    </div>
+  </div>
+</section>
+
+<section id="tab-assignments" class="tab card" role="tabpanel" hidden>
+  <div class="card-head"><h2>Assignments</h2>
+    <div class="head-tools">
+      <input id="assign-filter" class="text-input filter" type="search" placeholder="Filter by ASV or taxon" aria-label="Filter assignments">
+      <a class="ghost download" id="dl-assignments" download>Assignments CSV</a>
+      <a class="ghost download" id="dl-matches" download>All hits CSV</a>
+    </div></div>
+  <p class="hint">The rank is the deepest rank on which the selected references agree, at the chosen minimum agreement (100 % = strict LCA); it is not a statistical confidence. Click a row to see the references used, including dissenting ones.</p>
+  <div class="table-wrap"><table id="assign-table"></table></div>
+  <div id="match-panel" hidden>
+    <div class="card-head sub"><h2 id="match-title"></h2>
+      <a class="ghost download" id="dl-asv-matches" download>Hits of this ASV (CSV)</a></div>
+    <div class="table-wrap"><table id="match-table"></table></div>
+  </div>
+</section>
+
+<section id="tab-references" class="tab card" role="tabpanel" hidden>
+  <div class="card-head"><h2>Reference usage</h2>
+    <div class="head-tools">
+      <input id="ref-filter" class="text-input filter" type="search" placeholder="Process ID, taxon or identifier" aria-label="Filter references">
+      <a class="ghost download" id="dl-references" download>Reference usage CSV</a>
+    </div></div>
+  <p class="hint">Retrieved: ASVs whose BOLD matches include the record. LCA: ASVs whose LCA set includes it. Contribution: ASVs with an accepted assignment whose LCA set includes it. These counts describe participation; they do not show that a record was indispensable.</p>
+  <div class="table-wrap"><table id="ref-table"></table></div>
+</section>
+
+<section id="tab-attribution" class="tab card" role="tabpanel" hidden>
+  <div class="card-head"><h2>Taxonomic attribution</h2>
+    <a class="ghost download" id="dl-attribution" download>Attribution CSV</a></div>
+  <p class="hint">Identifiers are the verbatim BOLD <code>identified_by</code> values of the reference records: names are not merged or normalized (ORCID column reserved). No credit goes to sequencing laboratories, storing institutions, uploaders or project managers. The fractional credit is an experimental participation indicator, not a measure of merit; the table is ordered alphabetically.</p>
+  <div class="table-wrap"><table id="attr-table"></table></div>
+</section>
+
+<section id="tab-stats" class="tab card" role="tabpanel" hidden>
+  <div class="card-head"><h2>Statistics</h2>
+    <div class="head-tools">
+      <input id="stats-project" class="text-input small-input" placeholder="Project: all" aria-label="Project">
+      <input id="stats-user" class="text-input small-input" placeholder="User: all" aria-label="User">
+      <button id="stats-btn" class="ghost">Refresh</button>
+    </div>
+  </div>
+  <div class="card-body">
+    <div class="two">
+      <div><h3>Personal counter</h3><table id="stats-personal" class="kv"></table></div>
+      <div><h3>Global counter</h3><table id="stats-global" class="kv"></table><p class="small muted" id="global-note"></p></div>
+    </div>
+  </div>
+</section>
+
+<section id="tab-export" class="tab card" role="tabpanel" hidden>
+  <div class="card-head"><h2>Export</h2></div>
+  <div class="card-body">
+    <ul id="export-list" class="downloads-list"></ul>
+    <p class="small muted">The provenance report records the BOLD library, retrieval date, parameters, LCA version and selected process IDs. The BOLD API does not provide a database version: the limitation is written in the report.</p>
+  </div>
+</section>
+
+</main>
+<footer class="footer">BOLD data are subject to the terms of use of BOLD Systems. Statistics count only the analyses recorded by this application.</footer>
+</body>
+</html>

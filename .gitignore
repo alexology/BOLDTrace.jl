@@ -1,0 +1,4 @@
+Manifest.toml
+*.sqlite
+*.sqlite-journal
+bold_checkpoint/
