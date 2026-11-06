@@ -1000,4 +1000,41 @@ end
     @test !any(r -> "reference_classification_conflict" in r.flags, d.results)
 end
 
+
+@testset "Review regressions BT18" begin
+    # Concurrent starts: one wins, the other is refused as in the sequential
+    # case; nothing is left behind and a later start works.
+    @test BOLDTrace._APP[] === nothing
+    dir = mktempdir()
+    for round in 1:3
+        go = Channel{Nothing}(2)
+        ports = (19600 + 2round, 19601 + 2round)
+        tasks = [Threads.@spawn begin
+                     take!(go)
+                     try
+                         serve(; database = joinpath(dir, "c$(round)_$k.sqlite"), port = ports[k],
+                               async = true, checkpoint = nothing, portal_url = "https://portal.test")
+                     catch err
+                         err
+                     end
+                 end for k in 1:2]
+        put!(go, nothing); put!(go, nothing)
+        out = fetch.(tasks)
+        servers = filter(x -> x isa BOLDTrace.Genie.Server.ServersCollection, out)
+        refused = filter(x -> x isa ArgumentError && occursin("already running", x.msg), out)
+        @test length(servers) == 1 && length(refused) == 1
+        k = findfirst(x -> x isa BOLDTrace.Genie.Server.ServersCollection, out)
+        base = "http://127.0.0.1:$(ports[k])"
+        other = "http://127.0.0.1:$(ports[3 - k])"
+        @test req(base, "POST", "/api/upload"; body = JSON3.write((fasta = fasta,))).status == 200
+        app = BOLDTrace._APP[]
+        @test lock(() -> length(app.uploads), app.lock) == 1
+        @test (try HTTP.get(other * "/health"; retry = false, readtimeout = 2, connect_timeout = 2).status
+               catch; 0 end) == 0                        # the refused start opened no port
+        @test length(BOLDTrace._APPS) == 1
+        @test shutdown(only(servers))
+        @test BOLDTrace._APP[] === nothing && isempty(BOLDTrace._APPS)
+    end
+end
+
 end

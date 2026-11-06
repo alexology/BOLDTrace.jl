@@ -95,6 +95,7 @@ const _APP = Ref{Union{Nothing,_App}}(nothing)   # the running instance, if any
 # Instances by listener, so that `shutdown` acts only on its own server.
 const _APPS = IdDict{Any,_App}()
 const _APPS_LOCK = ReentrantLock()
+const _START_LOCK = ReentrantLock()    # held for the whole start of a server
 
 # Runs the queued jobs one at a time. After `shutdown` the jobs still queued
 # are cancelled; the running one completes and is recorded. The store is
@@ -564,42 +565,48 @@ function serve(; database::AbstractString = "boldtrace.sqlite", host::AbstractSt
     all(h -> h isa AbstractString, allowed_hosts) ||
         throw(ArgumentError("allowed_hosts must be a list of host names (strings)"))
     hosts = Set{String}(lowercase(strip(String(h))) for h in allowed_hosts)
-    old = _APP[]
-    old === nothing || old.stopping[] ||
-        throw(ArgumentError("a BOLDTrace server is already running in this session; call shutdown first"))
-    ip = string(Sockets.getaddrinfo(host))
-    _check_port(ip, Int(port))
-    store = open_store(database)
-    app = nothing
-    listener = try
-        app = _App(store, engine, checkpoint === nothing ? nothing : abspath(checkpoint),
-                   String(portal_url), Dict(), String[], Dict(), String[], Channel{_Job}(Inf),
-                   ReentrantLock(), Int(max_records), Int(max_kept), Int(max_pending), defaults,
-                   accept_rank,
-                   Threads.Atomic{Bool}(false), nothing, nothing)
-        app.worker = errormonitor(Threads.@spawn _worker_loop(app))
-        _APP[] = app
-        Genie.config.app_env = "prod"
-        Genie.config.server_document_root = mktempdir()
-        Genie.config.server_handle_static_files = false
-        Genie.config.server_signature = ""
-        Genie.config.log_requests = false
-        Genie.config.websockets_server = false
-        _register_routes(app)
-        HTTP.listen!(_stream_handler(hosts, Int(max_body)), parse(Sockets.IPAddr, ip), Int(port);
-                     max_connections = Int(max_connections))
-    catch
-        # Nothing may stay behind a failed start: the worker closes the store.
-        if app === nothing || app.worker === nothing
-            close(store)
-        else
-            _stop!(app; timeout = Inf)
+    # Check, reservation of the single instance and route set-up are atomic:
+    # concurrent calls are serialized, and the second one sees the first
+    # instance and is refused (Genie routes are global to the session).
+    app, listener = lock(_START_LOCK) do
+        old = _APP[]
+        old === nothing || old.stopping[] ||
+            throw(ArgumentError("a BOLDTrace server is already running in this session; call shutdown first"))
+        ip = string(Sockets.getaddrinfo(host))
+        _check_port(ip, Int(port))
+        store = open_store(database)
+        app = nothing
+        listener = try
+            app = _App(store, engine, checkpoint === nothing ? nothing : abspath(checkpoint),
+                       String(portal_url), Dict(), String[], Dict(), String[], Channel{_Job}(Inf),
+                       ReentrantLock(), Int(max_records), Int(max_kept), Int(max_pending), defaults,
+                       accept_rank,
+                       Threads.Atomic{Bool}(false), nothing, nothing)
+            app.worker = errormonitor(Threads.@spawn _worker_loop(app))
+            _APP[] = app
+            Genie.config.app_env = "prod"
+            Genie.config.server_document_root = mktempdir()
+            Genie.config.server_handle_static_files = false
+            Genie.config.server_signature = ""
+            Genie.config.log_requests = false
+            Genie.config.websockets_server = false
+            _register_routes(app)
+            HTTP.listen!(_stream_handler(hosts, Int(max_body)), parse(Sockets.IPAddr, ip), Int(port);
+                         max_connections = Int(max_connections))
+        catch
+            # Nothing may stay behind a failed start: the worker closes the store.
+            if app === nothing || app.worker === nothing
+                close(store)
+            else
+                _stop!(app; timeout = Inf)
+            end
+            app !== nothing && _APP[] === app && (_APP[] = nothing)
+            rethrow()
         end
-        app !== nothing && _APP[] === app && (_APP[] = nothing)
-        rethrow()
+        app.listener = listener
+        lock(() -> (_APPS[listener] = app), _APPS_LOCK)
+        (app, listener)
     end
-    app.listener = listener
-    lock(() -> (_APPS[listener] = app), _APPS_LOCK)
     server = Genie.Server.ServersCollection(webserver = listener)
     @info "BOLDTrace at http://$(host == "0.0.0.0" ? "localhost" : host):$port (database $(abspath(database)))"
     async && return server
