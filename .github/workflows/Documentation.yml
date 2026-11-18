@@ -1,0 +1,39 @@
+name: Documentation
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  actions: write
+  contents: write
+  pull-requests: read
+  statuses: write
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: BOLDTrace.jl
+      # Unregistered dependencies: docs/Project.toml and Project.toml find
+      # them next to BOLDTrace.jl through [sources] (Julia >= 1.11).
+      - name: Checkout BOLDassignment
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/BOLDassignment.jl
+          path: BOLDassignment.jl
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      - name: Install dependencies
+        run: julia --project=BOLDTrace.jl/docs -e 'using Pkg; Pkg.instantiate()'
+      - name: Build and deploy
+        run: julia --project=BOLDTrace.jl/docs BOLDTrace.jl/docs/make.jl
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

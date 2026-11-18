@@ -1,5 +1,7 @@
 # BOLDTrace.jl
 
+[![Docs](https://img.shields.io/badge/docs-dev-blue.svg)](https://alexology.github.io/BOLDTrace.jl/dev/)
+
 Identification of amplicon sequence variants (ASVs) through
 [BOLD Systems v5](https://id.boldsystems.org), lowest common ancestor (LCA)
 assignment, traceability of the BOLD reference records used and
@@ -15,20 +17,23 @@ High performance is a goal, not a measured guarantee.
 FASTA → BOLD identification engine → matches → LCA → assignment → usage counters → export
 ```
 
-## Install
+## Installation
 
-Not registered. BOLDTrace depends on
-[BOLDassignment.jl](https://github.com/alexology/BOLDassignment.jl), which is
-not registered either:
+This package is not registered in the Julia General registry, and neither
+is its dependency
+[BOLDassignment.jl](https://github.com/alexology/BOLDassignment.jl). Install
+both from GitHub, BOLDassignment.jl first:
 
 ```julia
 using Pkg
 Pkg.add(url = "https://github.com/alexology/BOLDassignment.jl")
-Pkg.develop(path = "path/to/BOLDTrace.jl")
+Pkg.add(url = "https://github.com/alexology/BOLDTrace.jl")
 ```
 
-With Julia ≥ 1.11, `[sources]` in `Project.toml` points to a sibling checkout
-`../BOLDassignment.jl`.
+or, from local copies, `Pkg.develop(path = "path/to/BOLDassignment.jl")` and
+then `Pkg.develop(path = "path/to/BOLDTrace.jl")`. With Julia ≥ 1.11
+`Project.toml` also points to `../BOLDassignment.jl` (`[sources]`), so a
+checkout next to BOLDassignment.jl works directly.
 
 ## Web application
 

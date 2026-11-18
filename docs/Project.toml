@@ -1,0 +1,9 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+BOLDTrace = "8f6c5ed8-6302-46ae-ba11-cfe154911e2e"
+
+[compat]
+Documenter = "1"
+
+[sources]
+BOLDTrace = {path = ".."}

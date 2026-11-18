@@ -266,7 +266,8 @@ _RESULT_MISSING() = LCAResult(:result_missing, nothing, nothing, Pair{Symbol,Str
                               Union{Nothing,Symbol}[], ["bold_result_missing"])
 
 # Unique sequences whose result BOLD did not return (`result_received`
-# false, BOLDassignment ≥ 0.1.2; older tables have no such column).
+# false; tables from BOLDassignment development versions before 0.1.2
+# (since renumbered 0.1.0 for registration) have no such column).
 function _missing_results(input::InputSet, hits::AbstractDataFrame, position)
     absent = falses(length(input.unique))
     hasproperty(hits, :result_received) || return absent

@@ -484,6 +484,26 @@ function _read_body(stream::HTTP.Stream, max_body::Int)
     return take!(buf)
 end
 
+# Bytes of a refused body read and discarded before the 413 response.
+const _DRAIN_LIMIT = 16 * 2^20
+
+# Reads and discards what is left of the request body, at most `limit` bytes,
+# so that a client still sending its body receives the error response instead
+# of a reset connection. Returns whether the whole body was read.
+function _drain_body!(stream::HTTP.Stream, limit::Int)
+    n = 0
+    try
+        while !eof(stream)
+            n += length(readavailable(stream))
+            n > limit && return false
+        end
+        return true
+    catch err
+        err isa Union{EOFError,Base.IOError,HTTP.Exceptions.HTTPError} || rethrow()
+        return false
+    end
+end
+
 # Checks host and body size before Genie reads the request (Genie would read
 # bodies of any size in memory), then hardens every response.
 function _stream_handler(allowed_hosts::Set{String}, max_body::Int)
@@ -498,6 +518,9 @@ function _stream_handler(allowed_hosts::Set{String}, max_body::Int)
         catch err
             if err isa _RequestError
                 close_after = err.status in (400, 413)
+                # A body that is too large is still read (up to a bound), so
+                # that the client gets the 413; the connection is then closed.
+                err.status == 413 && _drain_body!(stream, _DRAIN_LIMIT)
                 _error(err.status, err.msg)
             else
                 @error "Request failed" exception = (err, catch_backtrace())
@@ -575,8 +598,10 @@ function serve(; database::AbstractString = "boldtrace.sqlite", host::AbstractSt
         ip = string(Sockets.getaddrinfo(host))
         _check_port(ip, Int(port))
         store = open_store(database)
-        app = nothing
-        listener = try
+        # `local`: without it the closure would assign the `app` and
+        # `listener` of `serve` (boxed captured variables).
+        local app = nothing
+        local listener = try
             app = _App(store, engine, checkpoint === nothing ? nothing : abspath(checkpoint),
                        String(portal_url), Dict(), String[], Dict(), String[], Channel{_Job}(Inf),
                        ReentrantLock(), Int(max_records), Int(max_kept), Int(max_pending), defaults,
